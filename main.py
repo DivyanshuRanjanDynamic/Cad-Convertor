@@ -39,11 +39,25 @@ def _extract_hole_features(shape: cq.Workplane):
         seen_centers = [] # Deduplicate by center + axis to avoid overlaps
         
         for face in cylindrical_faces:
-            surf = face.wrapped.Surface().Value()
-            center = face.Center()
-            geom_center = surf.Position().Location()
-            axis = surf.Position().Direction()
-            radius = surf.Radius()
+            # Safely get the OCCT surface from the face
+            # We use the BRepAdaptor to handle different OCCT version pointer types
+            try:
+                from OCP.BRepAdaptor import BRepAdaptor_Surface
+                adaptor = BRepAdaptor_Surface(face.wrapped)
+                surf = adaptor.Surface()
+                
+                center = face.Center()
+                axis = surf.Cylinder().Position().Direction()
+                radius = surf.Cylinder().Radius()
+            except Exception:
+                # Fallback to direct access if OCP structure differs
+                try:
+                    surf = face.wrapped.Surface().Value()
+                    center = face.Center()
+                    axis = surf.Position().Direction()
+                    radius = surf.Radius()
+                except:
+                    continue # Skip faces that don't follow the cylinder schema
             
             # Simple heuristic to avoid non-hole cylinders (like curved edges of a plate)
             # True holes usually have a closed circular perimeter at their ends
@@ -108,16 +122,22 @@ def _extract_bend_features(shape: cq.Workplane):
         # We look for cylindrical segments that aren't complete 360-degree cylinders
         for face in potential_bends:
             # Check edge topology: Bends usually have linear and circular edges
-            # Circular edges for the profile, linear for the length of the fold
-            linear_edges = [e for e in face.Edges() if e.wrapped.Curve().Value().DynamicType().Name() == "Geom_Line"]
+            # We use the CadQuery high-level geomType() to avoid topoDS attribute errors
+            linear_edges = [e for e in face.Edges() if e.geomType() == "LINE"]
             
             if len(linear_edges) >= 2:
                 # This likely is a bend segment along a sheet metal fold
                 # The bend line is the centerline axis of this cylinder
-                surf = face.wrapped.Surface().Value()
-                axis_pos = surf.Position().Location()
-                axis_dir = surf.Position().Direction()
-                radius = surf.Radius()
+                # Safely get the OCCT surface for the bend axis
+                try:
+                    from OCP.BRepAdaptor import BRepAdaptor_Surface
+                    adaptor = BRepAdaptor_Surface(face.wrapped)
+                    surf = adaptor.Surface()
+                    
+                    axis_dir = surf.Cylinder().Position().Direction()
+                    radius = surf.Cylinder().Radius()
+                except:
+                    continue
                 
                 # Sheet metal bends usually have radius > thickness or similar thresholds
                 # Filter out small holes masquerading as bends

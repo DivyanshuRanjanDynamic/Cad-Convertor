@@ -61,5 +61,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # We use the JSON array form (exec form) to ensure signals (SIGTERM) are 
 # correctly propagated to the application.
 # The /bin/sh -c wrapper is used to perform environment variable expansion for ${PORT}.
-CMD ["/bin/sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 1 --loop uvloop --access-log"]
+CMD ["/bin/sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 2 --loop uvloop --access-log"]
 
