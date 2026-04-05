@@ -369,6 +369,20 @@ def _safe_unlink(path: str) -> None:
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.get("/", tags=["ops"])
+def root() -> dict:
+    """Root endpoint — provides service status and quick links."""
+    return {
+        "service": "MechHub CAD Converter",
+        "status": "online",
+        "version": app.version,
+        "endpoints": {
+            "health": "/health",
+            "convert": "/convert [POST]"
+        }
+    }
+
+
 @app.get("/health", tags=["ops"])
 def health() -> dict:
     """Liveness probe — Railway / Docker health check hits this."""
