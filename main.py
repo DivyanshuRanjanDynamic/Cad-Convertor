@@ -129,67 +129,70 @@ def _extract_bend_features(shape: cq.Workplane):
             
             try:
                 # 3. Extract pure geometry data via OCCT BRepAdaptor
-                from OCP.BRepAdaptor import BRepAdaptor_Surface
-                adaptor = BRepAdaptor_Surface(face.wrapped)
-                surf = adaptor.Surface()
-                
-                axis_pos = surf.Cylinder().Position().Location()
-                axis_dir = surf.Cylinder().Position().Direction()
-                radius = surf.Cylinder().Radius()
+                # Fallback mechanism for different OCCT version pointer types
+                try:
+                    from OCP.BRepAdaptor import BRepAdaptor_Surface
+                    adaptor = BRepAdaptor_Surface(face.wrapped)
+                    surf = adaptor.Surface()
+                    
+                    axis_pos = surf.Cylinder().Position().Location()
+                    axis_dir = surf.Cylinder().Position().Direction()
+                    radius = surf.Cylinder().Radius()
+                    
+                    # Get parametric range for angle calculation
+                    u_min, u_max = adaptor.FirstUParameter(), adaptor.LastUParameter()
+                except Exception:
+                    # Fallback to direct access if BRepAdaptor fails or structure differs
+                    surf = face.wrapped.Surface().Value()
+                    axis_pos = surf.Position().Location()
+                    axis_dir = surf.Position().Direction()
+                    radius = surf.Radius()
+                    u_min, u_max = 0, 0 # Fallback will use face area logic
                 
                 if radius < 0.2 or radius > 50: continue # Filter micro-fillets or massive curves
                 
                 # 4. Find the true length of the bend axis
-                # We project the midpoints of the linear boundaries onto the infinite axis
-                edge_p1 = linear_edges[0].Center()
-                edge_p2 = linear_edges[1].Center()
-                
-                # Scalar projection to find the span along the axis
-                vec_axis = cq.Vector(axis_dir.X(), axis_dir.Y(), axis_dir.Z())
-                p1_proj = cq.Vector(edge_p1.x, edge_p1.y, edge_p1.z).dot(vec_axis)
-                p2_proj = cq.Vector(edge_p2.x, edge_p2.y, edge_p2.z).dot(vec_axis) # This isn't length, but position
-                
-                # To find length, we must look at the linear edge endpoints
-                v1, v2 = linear_edges[0].startPoint(), linear_edges[0].endPoint()
-                length = (v1 - v2).Length
+                # We use the built-in Length property of the edge which is more robust
+                # than subtracting Vertex objects (which is not supported in many CQ versions).
+                length = linear_edges[0].Length
                 
                 # Construct start/end points on the axis
+                vec_axis = cq.Vector(axis_dir.X(), axis_dir.Y(), axis_dir.Z())
                 base_pos = cq.Vector(axis_pos.X(), axis_pos.Y(), axis_pos.Z())
+                
                 # Shift to the face center along the axis
-                face_center_on_axis = base_pos + vec_axis * (cq.Vector(face.Center().x, face.Center().y, face.Center().z).dot(vec_axis) - base_pos.dot(vec_axis))
+                face_center = face.Center()
+                face_proj = cq.Vector(face_center.x, face_center.y, face_center.z).dot(vec_axis)
+                base_proj = base_pos.dot(vec_axis)
+                
+                face_center_on_axis = base_pos + vec_axis * (face_proj - base_proj)
                 
                 start = face_center_on_axis - vec_axis * (length / 2.0)
                 end = face_center_on_axis + vec_axis * (length / 2.0)
                 
-                # 5. Angle Calculation (Crucial for SendCutSend visual parity)
-                # We look at the total span of the cylindrical arc
+                # 5. Angle Calculation
                 # Standard sheet metal: Angle = arc_length / radius (in radians)
-                # Alternatively, we can find the 2 adjacent faces.
-                # Simplified robust way: use the surface's parametric U-range
-                u_min, u_max, _, _ = adaptor.FirstUParameter(), adaptor.LastUParameter(), adaptor.FirstVParameter(), adaptor.LastVParameter()
-                angle_rad = abs(u_max - u_min)
-                angle_deg = round(angle_rad * (180.0 / 3.14159), 1)
+                if abs(u_max - u_min) > 0.001:
+                    angle_rad = abs(u_max - u_min)
+                else:
+                    # Fallback angle calculation via arc length / radius
+                    # The arc length is approximately the chord length if small, but we use surface area
+                    angle_rad = face.Area() / (radius * length)
                 
+                angle_deg = round(angle_rad * (180.0 / 3.14159), 1)
                 if angle_deg < 5 or angle_deg > 175: continue # Skip non-bend geometry
                 
                 # 6. Directional Detection (UP vs DOWN)
-                # Logic: If the center of curvature is 'below' the face relative to part centroid, it's UP
-                # (Assuming the larger flat face is 'bottom')
-                face_normal = face.NormalAt(face.Center())
-                to_curvature = (face_center_on_axis - cq.Vector(face.Center().x, face.Center().y, face.Center().z)).normalized()
+                # Logic: If the surface normal points away from the part centroid, it's curving "inward" (DOWN)
+                # otherwise it's curving "outward" (UP) relative to the base sheet.
+                face_normal = face.NormalAt(face_center)
+                vec_to_centroid = (cq.Vector(part_centroid.x, part_centroid.y, part_centroid.z) - cq.Vector(face_center.x, face_center.y, face_center.z))
                 
-                # Dot product check: does the surface point AWAY from its own curvature center?
-                # If dot is positive, it's convex (UP if viewing from side).
-                # We'll normalize to a 'Global Top' assumption (Z-up) for the 3D viewer.
-                direction = "UP" if face_normal.z > 0 else "DOWN"
-                
-                # A more robust industrial way: Convexity check
-                # For sheet metal, we look at the part centroid relative to the bend
-                vec_to_centroid = (cq.Vector(part_centroid.x, part_centroid.y, part_centroid.z) - cq.Vector(face.Center().x, face.Center().y, face.Center().z))
+                # Industrial convexity check
                 if face_normal.dot(vec_to_centroid) > 0:
-                   direction = "DOWN" # Curving inward towards part body
+                   direction = "DOWN"
                 else:
-                   direction = "UP" # Curving outward
+                   direction = "UP"
                 
                 bends.append({
                     "start": {"x": round(start.x, 3), "y": round(start.y, 3), "z": round(start.z, 3)},
@@ -199,7 +202,9 @@ def _extract_bend_features(shape: cq.Workplane):
                     "radius": round(radius, 3)
                 })
             except Exception as inner_e:
+                print(f"[CAD Converter] Skip bend face due to error: {inner_e}")
                 continue # Skip malformed bend faces
+
                 
     except Exception as e:
         print(f"[CAD Converter] Senior Bend Analysis Error: {e}")
