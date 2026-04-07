@@ -293,41 +293,42 @@ def _get_face_normal_at_point(face, point):
 
 
 def _classify_face_type(face):
-    """
-    Classify face geometry type safely. Returns one of:
-    'PLANE', 'CYLINDER', 'CONE', 'SPHERE', 'TORUS', 'BSPLINE', 'OTHER'
-    """
+    """Universal Face Classifier (V3) using curvature analysis (c1, c2)."""
     try:
         from OCP.BRepAdaptor import BRepAdaptor_Surface
-        from OCP.GeomAbs import (
-            GeomAbs_Plane, GeomAbs_Cylinder, GeomAbs_Cone,
-            GeomAbs_Sphere, GeomAbs_Torus, GeomAbs_BSplineSurface,
-            GeomAbs_BezierSurface
-        )
+        from OCP.GeomLProp import GeomLProp_SLProps
+        from OCP.GeomAbs import GeomAbs_Plane, GeomAbs_Cylinder
+
         adaptor = BRepAdaptor_Surface(face)
         stype = adaptor.GetType()
 
-        # Handle BSpline surfaces that are actually planes
-        if stype in (GeomAbs_BSplineSurface, GeomAbs_BezierSurface):
-            from OCP.GeomLProp import GeomLProp_SLProps
-            # Check flatness at surface center (u=0.5, v=0.5). Order 2 for curvature.
-            props = GeomLProp_SLProps(adaptor.Surface(), 0.5, 0.5, 2, 1e-7)
-            if props.IsNormalDefined():
-                c1, c2 = abs(props.MaxCurvature()), abs(props.MinCurvature())
-                # If curvature is negligible, it's effectively a plane
-                if c1 < 1e-4 and c2 < 1e-4:
-                    return 'PLANE'
+        # Phase 1: Direct Analytical Check
+        if stype == GeomAbs_Plane: return 'PLANE'
+        if stype == GeomAbs_Cylinder: return 'CYLINDER'
 
-        type_map = {
-            GeomAbs_Plane: 'PLANE',
-            GeomAbs_Cylinder: 'CYLINDER',
-            GeomAbs_Cone: 'CONE',
-            GeomAbs_Sphere: 'SPHERE',
-            GeomAbs_Torus: 'TORUS',
-            GeomAbs_BSplineSurface: 'BSPLINE',
-            GeomAbs_BezierSurface: 'BSPLINE',
-        }
-        return type_map.get(stype, 'OTHER')
+        # Phase 2: Differential Geometry Check (Curvature)
+        # Sample at center (0.5) and quadrant points to be robust.
+        samples = [(0.5, 0.5), (0.2, 0.2), (0.8, 0.8), (0.2, 0.8), (0.8, 0.2)]
+        max_c1, max_c2 = 0.0, 0.0
+        
+        for u, v in samples:
+            u_p = adaptor.FirstUParameter() + u * (adaptor.LastUParameter() - adaptor.FirstUParameter())
+            v_p = adaptor.FirstVParameter() + v * (adaptor.LastVParameter() - adaptor.FirstVParameter())
+            props = GeomLProp_SLProps(adaptor.Surface(), u_p, v_p, 2, 1e-7)
+            if props.IsNormalDefined():
+                c1 = abs(props.MaxCurvature())
+                c2 = abs(props.MinCurvature())
+                max_c1 = max(max_c1, c1)
+                max_c2 = max(max_c2, c2)
+
+        # Classification thresholds (Refined for Industrial fallback)
+        if max_c1 < 5e-4: return 'PLANE' 
+        if max_c2 < 5e-4: return 'CYLINDER'
+        
+        if max_c1 < 1e-2:
+            print(f"[DebugV3] Face potential miss: c1={max_c1:.6f}, c2={max_c2:.6f}")
+        
+        return 'OTHER'
     except Exception:
         return 'OTHER'
 
@@ -359,7 +360,6 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
     print(f"[BendV2] Starting analysis for part with {shape.faces().size()} faces.")
     
     try:
-        from OCP.TopTools import TopTools_ListIteratorOfListOfShape
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
 
@@ -398,13 +398,23 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
                         idx = edge_face_map.FindIndex(edge)
                         if idx > 0:
                             f_list = edge_face_map.FindFromIndex(idx)
-                            f_iter = TopTools_ListIteratorOfListOfShape(f_list)
-                            while f_iter.More():
-                                adj_face = f_iter.Value()
+                            # Convert to Python list for iteration (most robust in OCP)
+                            adj_faces = []
+                            try:
+                                # Fallback iteration if ListOfShape is not directly iterable
+                                it = f_list.Iterator()
+                                while it.More():
+                                    adj_faces.append(it.Value())
+                                    it.Next()
+                            except:
+                                # Ultimate fallback
+                                try: adj_faces = list(f_list)
+                                except: pass
+
+                            for adj_face in adj_faces:
                                 if not adj_face.IsSame(face) and _classify_face_type(adj_face) == 'PLANE':
                                     if not any(adj_face.IsSame(p) for p in neighbor_planes):
                                         neighbor_planes.append(adj_face)
-                                f_iter.Next()
                     except Exception as e:
                         print(f"[DebugCAD] S.A iterator error: {e}")
                     edge_exp.Next()
@@ -456,12 +466,16 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
         for i in range(1, edge_face_map.Extent() + 1):
             try:
                 f_list = edge_face_map.FindFromIndex(i)
-                f_iter = TopTools_ListIteratorOfListOfShape(f_list)
                 faces = []
-                while f_iter.More():
-                    faces.append(f_iter.Value())
-                    f_iter.Next()
-                
+                try:
+                    it = f_list.Iterator()
+                    while it.More():
+                        faces.append(it.Value())
+                        it.Next()
+                except:
+                    try: faces = list(f_list)
+                    except: pass
+
                 if len(faces) != 2: continue
                 if _classify_face_type(faces[0]) == 'PLANE' and _classify_face_type(faces[1]) == 'PLANE':
                     sharp_count += 1
@@ -597,10 +611,14 @@ def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness
         from OCP.TopAbs import TopAbs_EDGE
         from OCP.BRepAdaptor import BRepAdaptor_Curve
 
+        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+        from OCP.TopExp import TopExp_Explorer
+        
         solid = shape.val().wrapped
 
-        # Determine the best projection direction.
-        # FIND THE LARGEST PLANAR FACE NORMAL (Best for sheet metal preview)
+        # Determine the best projection direction (V3 Orientation Logic)
+        # We find the Largest Planar Face Normal. For a sheet metal part, 
+        # this is almost always the main surface or base.
         proj_dir = gp_Dir(0, 0, 1)
         up_dir = gp_Dir(0, 1, 0)
         
@@ -618,17 +636,16 @@ def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness
                     from OCP.BRepAdaptor import BRepAdaptor_Surface
                     adaptor = BRepAdaptor_Surface(f)
                     norm = adaptor.Plane().Axis().Direction()
-                    # Try to pick outward/top normal
+                    # Orientation refinement
                     proj_dir = gp_Dir(norm.X(), norm.Y(), norm.Z())
-                    # Pick an arbitrary up-vector that's not parallel to projection
                     if abs(proj_dir.Z()) < 0.9:
                         up_dir = gp_Dir(0, 0, 1)
                     else:
                         up_dir = gp_Dir(0, 1, 0)
                     max_area = area
             face_exp.Next()
-        
-        print(f"[DebugCAD] Picked projection direction: ({proj_dir.X():.2f}, {proj_dir.Y():.2f}, {proj_dir.Z():.2f}) based on face area {max_area:.1f}")
+            
+        print(f"[DebugV3] Selected projection: ({proj_dir.X():.2f}, {proj_dir.Y():.2f}, {proj_dir.Z():.2f}) - Ref Area: {max_area:.1f}")
 
         # Run HLR (Hidden Line Removal) projection
         hlr = HLRBRep_Algo()
