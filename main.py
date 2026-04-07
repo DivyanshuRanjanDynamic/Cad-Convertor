@@ -328,9 +328,9 @@ def _classify_face_type(face):
                 max_c1 = max(max_c1, c1)
                 max_c2 = max(max_c2, c2)
 
-        # Classification thresholds (Refined for Industrial fallback)
-        if max_c1 < 5e-4: return 'PLANE' 
-        if max_c2 < 5e-4: return 'CYLINDER'
+        # Classification thresholds tuned for imported trimmed surfaces.
+        if max_c1 < 5e-3: return 'PLANE'
+        if max_c2 < 5e-3: return 'CYLINDER'
         
         if max_c1 < 1e-2:
             print(f"[DebugV3] Face potential miss: c1={max_c1:.6f}, c2={max_c2:.6f}")
@@ -443,6 +443,215 @@ def _default_radius_from_thickness(thickness: Optional[float]) -> float:
     if thickness and thickness > 0:
         return round(max(0.0, thickness * 0.5), 3)
     return 0.0
+
+
+def _line_midpoint_from_bend(b: Dict[str, Any]) -> cq.Vector:
+    s = b["start"]
+    e = b["end"]
+    return cq.Vector((s["x"] + e["x"]) * 0.5, (s["y"] + e["y"]) * 0.5, (s["z"] + e["z"]) * 0.5)
+
+
+def _line_dir_from_bend(b: Dict[str, Any]) -> cq.Vector:
+    s = b["start"]
+    e = b["end"]
+    v = cq.Vector(e["x"] - s["x"], e["y"] - s["y"], e["z"] - s["z"])
+    return v.normalized() if v.Length > 1e-9 else cq.Vector(1, 0, 0)
+
+
+def _line_length_from_bend(b: Dict[str, Any]) -> float:
+    s = b["start"]
+    e = b["end"]
+    return math.sqrt((e["x"] - s["x"]) ** 2 + (e["y"] - s["y"]) ** 2 + (e["z"] - s["z"]) ** 2)
+
+
+def _shortest_distance_between_lines(
+    p1: cq.Vector, d1: cq.Vector, p2: cq.Vector, d2: cq.Vector
+) -> float:
+    # For nearly parallel lines, distance is norm((p2-p1) x d1).
+    n = d1.cross(d2)
+    n_len = n.Length
+    diff = p2 - p1
+    if n_len < 1e-8:
+        return diff.cross(d1).Length
+    return abs(diff.dot(n.normalized()))
+
+
+def _normalize_bend_record(b: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(b)
+    out["angle"] = round(float(out["angle"]), 1)
+    out["radius"] = round(max(0.0, float(out["radius"])), 3)
+    out["direction"] = "UP" if out.get("direction", "UP") == "UP" else "DOWN"
+    return out
+
+
+def _post_filter_manufacturing_bends(
+    bends: List[Dict[str, Any]], thickness: Optional[float]
+) -> List[Dict[str, Any]]:
+    if not bends:
+        return []
+
+    # Detect -> merge duplicates (inner/outer) -> merge collinear -> thresholds
+    # -> manufacturability classify -> normalize.
+    angle_merge_tol = 2.0
+    dir_tol = 0.02
+    line_dist_tol = max(1.5, (thickness or 1.0) * 1.5)
+    endpoint_tol = max(1.0, (thickness or 1.0) * 1.2)
+    min_len = max(5.0, (thickness or 1.0) * 3.0)
+    min_angle = 10.0
+    max_angle = 175.0
+    min_cyl_coverage = 15.0
+
+    work = [_normalize_bend_record(b) for b in bends]
+
+    # 1) Duplicate merge by line-to-line distance + axis alignment (not midpoint only).
+    consumed = [False] * len(work)
+    deduped: List[Dict[str, Any]] = []
+    for i, base in enumerate(work):
+        if consumed[i]:
+            continue
+        p1 = _line_midpoint_from_bend(base)
+        d1 = _line_dir_from_bend(base)
+        cluster = [base]
+        consumed[i] = True
+        for j in range(i + 1, len(work)):
+            if consumed[j]:
+                continue
+            cand = work[j]
+            if abs(cand["angle"] - base["angle"]) > angle_merge_tol:
+                continue
+            d2 = _line_dir_from_bend(cand)
+            if abs(abs(d1.dot(d2)) - 1.0) > dir_tol:
+                continue
+            p2 = _line_midpoint_from_bend(cand)
+            dist = _shortest_distance_between_lines(p1, d1, p2, d2)
+            if dist <= line_dist_tol:
+                cluster.append(cand)
+                consumed[j] = True
+        # Representative: longest line, with largest radius on tie.
+        cluster.sort(
+            key=lambda b: (_line_length_from_bend(b), float(b["radius"])),
+            reverse=True,
+        )
+        rep = dict(cluster[0])
+        rep["angle"] = round(sum(b["angle"] for b in cluster) / len(cluster), 1)
+        rep["radius"] = round(max(b["radius"] for b in cluster), 3)
+        deduped.append(rep)
+
+    # 2) Merge collinear connected segments with bend-axis consistency.
+    merged: List[Dict[str, Any]] = []
+    consumed = [False] * len(deduped)
+    for i, base in enumerate(deduped):
+        if consumed[i]:
+            continue
+        chain = [base]
+        consumed[i] = True
+        ds = _line_dir_from_bend(base)
+        for j in range(i + 1, len(deduped)):
+            if consumed[j]:
+                continue
+            cand = deduped[j]
+            if cand["direction"] != base["direction"]:
+                continue
+            if abs(cand["angle"] - base["angle"]) > angle_merge_tol:
+                continue
+            dc = _line_dir_from_bend(cand)
+            if abs(abs(ds.dot(dc)) - 1.0) > dir_tol:
+                continue
+            # Axis consistency
+            axis_dist = _shortest_distance_between_lines(
+                _line_midpoint_from_bend(base), ds, _line_midpoint_from_bend(cand), dc
+            )
+            if axis_dist > line_dist_tol:
+                continue
+            # Connectivity
+            a1 = cq.Vector(base["start"]["x"], base["start"]["y"], base["start"]["z"])
+            a2 = cq.Vector(base["end"]["x"], base["end"]["y"], base["end"]["z"])
+            b1 = cq.Vector(cand["start"]["x"], cand["start"]["y"], cand["start"]["z"])
+            b2 = cq.Vector(cand["end"]["x"], cand["end"]["y"], cand["end"]["z"])
+            dmin = min(
+                _endpoint_distance(a1, b1),
+                _endpoint_distance(a1, b2),
+                _endpoint_distance(a2, b1),
+                _endpoint_distance(a2, b2),
+            )
+            if dmin <= endpoint_tol:
+                chain.append(cand)
+                consumed[j] = True
+
+        if len(chain) == 1:
+            merged.append(chain[0])
+            continue
+
+        pts = []
+        for c in chain:
+            pts.append(cq.Vector(c["start"]["x"], c["start"]["y"], c["start"]["z"]))
+            pts.append(cq.Vector(c["end"]["x"], c["end"]["y"], c["end"]["z"]))
+        axis = _line_dir_from_bend(chain[0])
+        origin = pts[0]
+        projs = [(p - origin).dot(axis) for p in pts]
+        p_start = origin + axis * min(projs)
+        p_end = origin + axis * max(projs)
+        merged.append(
+            {
+                "start": {"x": round(p_start.x, 3), "y": round(p_start.y, 3), "z": round(p_start.z, 3)},
+                "end": {"x": round(p_end.x, 3), "y": round(p_end.y, 3), "z": round(p_end.z, 3)},
+                "angle": round(sum(c["angle"] for c in chain) / len(chain), 1),
+                "direction": chain[0]["direction"],
+                "radius": round(max(c["radius"] for c in chain), 3),
+            }
+        )
+
+    # 3) Thresholds and manufacturability classification.
+    filtered: List[Dict[str, Any]] = []
+    for b in merged:
+        angle = float(b["angle"])
+        length = _line_length_from_bend(b)
+        radius = float(b["radius"])
+        if angle < min_angle:
+            continue
+        if angle > max_angle:
+            continue
+        if length < min_len:
+            continue
+        # Cylindrical coverage guard to kill tiny fillets/corners.
+        if radius > 0 and angle < min_cyl_coverage:
+            continue
+        # Radius sanity using thickness if available.
+        if thickness and thickness > 0:
+            if radius > 0 and radius < 0.15 * thickness:
+                continue
+            if radius > 0 and radius > 20.0 * thickness and angle < 25.0:
+                continue
+        filtered.append(_normalize_bend_record(b))
+
+    # 4) Bend connectivity graph pruning: keep this conservative to avoid
+    # over-pruning valid manufacturing bends in sparse/complex imported models.
+    if len(filtered) <= 1:
+        return filtered
+    mids = [_line_midpoint_from_bend(b) for b in filtered]
+    dirs = [_line_dir_from_bend(b) for b in filtered]
+    neighbor_counts = [0] * len(filtered)
+    connect_dist = max(8.0, (thickness or 1.0) * 6.0)
+    for i in range(len(filtered)):
+        for j in range(i + 1, len(filtered)):
+            if abs(abs(dirs[i].dot(dirs[j])) - 1.0) > 0.2:
+                continue
+            if (mids[i] - mids[j]).Length <= connect_dist:
+                neighbor_counts[i] += 1
+                neighbor_counts[j] += 1
+
+    connected = [b for i, b in enumerate(filtered) if neighbor_counts[i] > 0]
+    # Only apply pruning when enough structure exists; otherwise keep filtered set.
+    if connected and len(connected) >= max(2, int(0.5 * len(filtered))):
+        filtered = connected
+
+    filtered.sort(
+        key=lambda b: (
+            b["start"]["x"], b["start"]["y"], b["start"]["z"],
+            b["end"]["x"], b["end"]["y"], b["end"]["z"],
+        )
+    )
+    return filtered
 
 
 def _are_collinear(v1: cq.Vector, v2: cq.Vector, tol: float = 0.02) -> bool:
@@ -627,7 +836,7 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
             # edge->face adjacency is effectively empty. Fall back to the legacy
             # cylindrical-face strategy instead of returning a hard 0 bends.
             print("[BendV2] No adjacency candidates; falling back to legacy bend detection.")
-            return _extract_bend_features(shape)
+            return _post_filter_manufacturing_bends(_extract_bend_features(shape), thickness)
 
         # Group collinear splits: same adjacent faces + similar angle + same direction + connected.
         grouped: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = {}
@@ -705,6 +914,7 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
                 }
             )
 
+        bends = _post_filter_manufacturing_bends(bends, thickness)
         print(
             f"[BendV2] candidates={len(candidate_rows)} merged={len(bends)} "
             f"boundarySkipped={skipped_boundary} nonManifoldSkipped={skipped_non_manifold}"
