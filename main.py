@@ -12,6 +12,7 @@ TypeScript interface in the MechHub studio frontend.
 """
 
 import base64
+from collections import Counter
 import io
 import math
 import os
@@ -205,16 +206,19 @@ def _extract_bend_features(shape: cq.Workplane):
                 if angle_deg < 5 or angle_deg > 185: continue 
                 
                 # 6. Directional Detection (UP vs DOWN)
-                # Logic: If the surface normal points away from the part centroid, it's curving "inward" (DOWN)
-                # otherwise it's curving "outward" (UP) relative to the base sheet.
-                face_normal = face.NormalAt(face_center)
-                vec_to_centroid = (cq.Vector(part_centroid.x, part_centroid.y, part_centroid.z) - cq.Vector(face_center.x, face_center.y, face_center.z))
-                
+                # Some imported cylinders fail face.NormalAt(center) for partial trims.
+                # Use robust normal sampling with midpoint fallback.
+                face_center_v = cq.Vector(face_center.x, face_center.y, face_center.z)
+                face_normal = _get_face_normal_at_point(face.wrapped, face_center_v)
+                if face_normal is None:
+                    face_normal = cq.Vector(0, 0, 1)
+                vec_to_centroid = (
+                    cq.Vector(part_centroid.x, part_centroid.y, part_centroid.z)
+                    - face_center_v
+                )
+
                 # Industrial convexity check
-                if face_normal.dot(vec_to_centroid) > 0:
-                   direction = "DOWN"
-                else:
-                   direction = "UP"
+                direction = "DOWN" if face_normal.dot(vec_to_centroid) > 0 else "UP"
                 
                 bends.append({
                     "start": {"x": round(start.x, 3), "y": round(start.y, 3), "z": round(start.z, 3)},
@@ -223,7 +227,8 @@ def _extract_bend_features(shape: cq.Workplane):
                     "direction": direction,
                     "radius": round(radius, 3)
                 })
-            except Exception:
+            except Exception as e:
+                print(f"[Bending] Face #{idx} skipped: {e}")
                 continue # Skip malformed bend faces
                 
     except Exception as e:
@@ -236,22 +241,6 @@ def _extract_bend_features(shape: cq.Workplane):
 # This is the new production algorithm used by the /analyze-bends endpoint.
 # The original _extract_bend_features() above is preserved for backwards
 # compatibility with the /convert endpoint.
-
-def _build_edge_face_map(solid):
-    """
-    Build edge → adjacent-faces adjacency map using OCCT TopExp.
-    Returns dict[edge_hash] = [face1, face2, ...]
-    """
-    from OCP.TopExp import TopExp
-    from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
-    from OCP.TopTools import TopTools_IndexedDataMapOfShapeListOfShape
-
-    edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
-    TopExp.MapShapesAndAncestors_s(
-        solid, TopAbs_EDGE, TopAbs_FACE, edge_face_map
-    )
-    return edge_face_map
-
 
 def _get_face_normal_at_point(face, point):
     """
@@ -289,7 +278,25 @@ def _get_face_normal_at_point(face, point):
 
         return cq.Vector(normal.X() / mag, normal.Y() / mag, normal.Z() / mag)
     except Exception:
-        return None
+        # Fallback: evaluate normal at face UV midpoint.
+        try:
+            from OCP.BRepAdaptor import BRepAdaptor_Surface
+            from OCP.BRepGProp import BRepGProp_Face
+            from OCP.gp import gp_Pnt as gp_Pnt2, gp_Vec
+
+            adaptor = BRepAdaptor_Surface(face)
+            u = 0.5 * (adaptor.FirstUParameter() + adaptor.LastUParameter())
+            v = 0.5 * (adaptor.FirstVParameter() + adaptor.LastVParameter())
+            prop = BRepGProp_Face(face)
+            pnt = gp_Pnt2()
+            normal = gp_Vec()
+            prop.Normal(u, v, pnt, normal)
+            mag = normal.Magnitude()
+            if mag < 1e-10:
+                return None
+            return cq.Vector(normal.X() / mag, normal.Y() / mag, normal.Z() / mag)
+        except Exception:
+            return None
 
 
 def _classify_face_type(face):
@@ -354,175 +361,359 @@ def _edge_midpoint(edge):
         return None
 
 
-def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
-    """V2 Topology-based bend detection."""
-    bends: List[Dict[str, Any]] = []
-    print(f"[BendV2] Starting analysis for part with {shape.faces().size()} faces.")
-    
+def _shape_to_faces(shape_wrapped):
+    from OCP.TopAbs import TopAbs_FACE
+    from OCP.TopExp import TopExp_Explorer
+
+    out = []
+    exp = TopExp_Explorer(shape_wrapped, TopAbs_FACE)
+    while exp.More():
+        out.append(exp.Current())
+        exp.Next()
+    return out
+
+
+def _list_from_toptools_shape_list(shape_list) -> List[Any]:
+    out = []
     try:
-        from OCP.TopExp import TopExp_Explorer
-        from OCP.TopAbs import TopAbs_FACE, TopAbs_EDGE
+        it = shape_list.Iterator()
+        while it.More():
+            out.append(it.Value())
+            it.Next()
+    except Exception:
+        try:
+            out = list(shape_list)
+        except Exception:
+            out = []
+    return out
 
+
+def _face_key(face) -> str:
+    return str(hash(face))
+
+
+def _canonical_face_pair(f1, f2) -> Tuple[str, str]:
+    a = _face_key(f1)
+    b = _face_key(f2)
+    return (a, b) if a <= b else (b, a)
+
+
+def _edge_length(edge) -> float:
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_AbscissaPoint
+
+        curve = BRepAdaptor_Curve(edge)
+        return float(
+            GCPnts_AbscissaPoint.Length_s(
+                curve, curve.FirstParameter(), curve.LastParameter()
+            )
+        )
+    except Exception:
+        return 0.0
+
+
+def _edge_endpoints(edge) -> Optional[Tuple[cq.Vector, cq.Vector]]:
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        curve = BRepAdaptor_Curve(edge)
+        p1 = curve.Value(curve.FirstParameter())
+        p2 = curve.Value(curve.LastParameter())
+        return (
+            cq.Vector(p1.X(), p1.Y(), p1.Z()),
+            cq.Vector(p2.X(), p2.Y(), p2.Z()),
+        )
+    except Exception:
+        return None
+
+
+def _face_midpoint(face) -> Optional[cq.Vector]:
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        adaptor = BRepAdaptor_Surface(face)
+        u = 0.5 * (adaptor.FirstUParameter() + adaptor.LastUParameter())
+        v = 0.5 * (adaptor.FirstVParameter() + adaptor.LastVParameter())
+        p = adaptor.Value(u, v)
+        return cq.Vector(p.X(), p.Y(), p.Z())
+    except Exception:
+        return None
+
+
+def _default_radius_from_thickness(thickness: Optional[float]) -> float:
+    if thickness and thickness > 0:
+        return round(max(0.0, thickness * 0.5), 3)
+    return 0.0
+
+
+def _are_collinear(v1: cq.Vector, v2: cq.Vector, tol: float = 0.02) -> bool:
+    if v1.Length < 1e-9 or v2.Length < 1e-9:
+        return False
+    a = v1.normalized()
+    b = v2.normalized()
+    return abs(abs(a.dot(b)) - 1.0) <= tol
+
+
+def _endpoint_distance(a: cq.Vector, b: cq.Vector) -> float:
+    return (a - b).Length
+
+
+def _merge_collinear_segments(segments: List[Dict[str, Any]], tol: float = 1.0) -> Dict[str, Any]:
+    if len(segments) == 1:
+        return segments[0]
+
+    # Build a simple path by greedily stitching nearest endpoints.
+    used = [False] * len(segments)
+    chain = [segments[0]]
+    used[0] = True
+    while True:
+        extended = False
+        head_s = chain[0]["_start_v"]
+        head_e = chain[0]["_end_v"]
+        tail_s = chain[-1]["_start_v"]
+        tail_e = chain[-1]["_end_v"]
+        for i, seg in enumerate(segments):
+            if used[i]:
+                continue
+            a = seg["_start_v"]
+            b = seg["_end_v"]
+            if min(_endpoint_distance(a, head_s), _endpoint_distance(b, head_s)) <= tol:
+                if _endpoint_distance(b, head_s) < _endpoint_distance(a, head_s):
+                    seg = {**seg, "_start_v": b, "_end_v": a}
+                chain.insert(0, seg)
+                used[i] = True
+                extended = True
+                break
+            if min(_endpoint_distance(a, tail_e), _endpoint_distance(b, tail_e)) <= tol:
+                if _endpoint_distance(a, tail_e) > _endpoint_distance(b, tail_e):
+                    seg = {**seg, "_start_v": b, "_end_v": a}
+                chain.append(seg)
+                used[i] = True
+                extended = True
+                break
+            # Allow reversing first or last segment if needed.
+            if min(_endpoint_distance(a, head_e), _endpoint_distance(b, head_e)) <= tol:
+                if _endpoint_distance(b, head_e) < _endpoint_distance(a, head_e):
+                    seg = {**seg, "_start_v": b, "_end_v": a}
+                chain.insert(0, seg)
+                used[i] = True
+                extended = True
+                break
+            if min(_endpoint_distance(a, tail_s), _endpoint_distance(b, tail_s)) <= tol:
+                if _endpoint_distance(a, tail_s) > _endpoint_distance(b, tail_s):
+                    seg = {**seg, "_start_v": b, "_end_v": a}
+                chain.append(seg)
+                used[i] = True
+                extended = True
+                break
+        if not extended:
+            break
+
+    first = chain[0]["_start_v"]
+    last = chain[-1]["_end_v"]
+    merged = dict(chain[0])
+    merged["_start_v"] = first
+    merged["_end_v"] = last
+    merged["_edge_len"] = _endpoint_distance(first, last)
+    merged["radius"] = round(sum(seg["radius"] for seg in chain) / len(chain), 3)
+    return merged
+
+
+def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
+    """
+    Edge-adjacency bend detection:
+    bend edge = edge with exactly two adjacent faces whose normals are not parallel.
+    """
+    try:
         wrapped = shape.val().wrapped
-        part_center = shape.val().Center()
-        part_centroid = cq.Vector(part_center.x, part_center.y, part_center.z)
-
-        # Build adjacency map globally for the shape
         edge_face_map = _build_edge_face_map(wrapped)
-        
-        # Telemetry: Log unique face types
-        face_types = {}
-        all_faces_exp = TopExp_Explorer(wrapped, TopAbs_FACE)
-        while all_faces_exp.More():
-            ft = _classify_face_type(all_faces_exp.Current())
-            face_types[ft] = face_types.get(ft, 0) + 1
-            all_faces_exp.Next()
-        print(f"[DebugCAD] Face types summary: {face_types}")
+        thickness = _detect_thickness(shape)
 
-        raw_bends: List[Dict[str, Any]] = []
+        face_types = Counter(_classify_face_type(face) for face in _shape_to_faces(wrapped))
+        non_sheet_faces = sum(
+            count for ft, count in face_types.items() if ft not in ("PLANE", "CYLINDER")
+        )
+        if non_sheet_faces > 0:
+            print(f"[BendV2] Non-sheet candidate faces detected: {dict(face_types)}")
+            # Keep detection running for mixed/dirty STEP models.
+            # We later filter by edge-level angular checks.
 
-        # ── Strategy A: Fillet-based detection ──
-        face_explorer = TopExp_Explorer(wrapped, TopAbs_FACE)
-        fillet_count = 0
-        while face_explorer.More():
-            face = face_explorer.Current()
-            face_type = _classify_face_type(face)
+        if not _validate_sheet_metal_shape(shape, thickness):
+            # Do not fail hard; some valid parts still contain auxiliary geometry.
+            print("[BendV2] Sheet-metal validation failed; continuing with tolerant detection.")
 
-            if face_type in ('CYLINDER', 'CONE', 'BSPLINE'):
-                fillet_count += 1
-                neighbor_planes = []
-                edge_exp = TopExp_Explorer(face, TopAbs_EDGE)
-                while edge_exp.More():
-                    edge = edge_exp.Current()
-                    try:
-                        idx = edge_face_map.FindIndex(edge)
-                        if idx > 0:
-                            f_list = edge_face_map.FindFromIndex(idx)
-                            # Convert to Python list for iteration (most robust in OCP)
-                            adj_faces = []
-                            try:
-                                # Fallback iteration if ListOfShape is not directly iterable
-                                it = f_list.Iterator()
-                                while it.More():
-                                    adj_faces.append(it.Value())
-                                    it.Next()
-                            except:
-                                # Ultimate fallback
-                                try: adj_faces = list(f_list)
-                                except: pass
+        flat_tol_deg = 2.0
+        angle_tol_group_deg = 1.5
+        parallel_dot_tol = math.cos(math.radians(flat_tol_deg))
+        candidate_rows: List[Dict[str, Any]] = []
+        skipped_non_manifold = 0
+        skipped_boundary = 0
+        face_normal_cache: Dict[str, Optional[cq.Vector]] = {}
 
-                            for adj_face in adj_faces:
-                                if not adj_face.IsSame(face) and _classify_face_type(adj_face) == 'PLANE':
-                                    if not any(adj_face.IsSame(p) for p in neighbor_planes):
-                                        neighbor_planes.append(adj_face)
-                    except Exception as e:
-                        print(f"[DebugCAD] S.A iterator error: {e}")
-                    edge_exp.Next()
-
-                if len(neighbor_planes) >= 2:
-                    f1n, f2n = neighbor_planes[0], neighbor_planes[1]
-                    from OCP.BRepGProp import BRepGProp
-                    from OCP.GProp import GProp_GProps
-                    props = GProp_GProps()
-                    BRepGProp.SurfaceProperties_s(face, props)
-                    fc = props.CentreOfMass()
-                    face_center = cq.Vector(fc.X(), fc.Y(), fc.Z())
-
-                    n1 = _get_face_normal_at_point(f1n, face_center)
-                    n2 = _get_face_normal_at_point(f2n, face_center)
-
-                    if n1 and n2:
-                        dot = max(-1.0, min(1.0, n1.dot(n2)))
-                        theta = math.degrees(math.acos(dot))
-                        bend_angle = round(180.0 - theta, 1)
-
-                        if 2.0 <= bend_angle <= 178.0:
-                            radius = _get_cylinder_radius(face) or 1.0
-                            # Extract bend line (longest edge)
-                            best_len = 0.0
-                            start_pt, end_pt = face_center, face_center
-                            ee = TopExp_Explorer(face, TopAbs_EDGE)
-                            while ee.More():
-                                e = ee.Current()
-                                cur_l = _edge_length(e)
-                                if cur_l > best_len:
-                                    pts = _edge_endpoints(e)
-                                    if pts: start_pt, end_pt, best_len = pts[0], pts[1], cur_l
-                                ee.Next()
-
-                            direction = "UP" if n1.cross(n2).dot(part_centroid - face_center) < 0 else "DOWN"
-                            raw_bends.append({
-                                "start": {"x": round(start_pt.x, 3), "y": round(start_pt.y, 3), "z": round(start_pt.z, 3)},
-                                "end": {"x": round(end_pt.x, 3), "y": round(end_pt.y, 3), "z": round(end_pt.z, 3)},
-                                "angle": bend_angle, "direction": direction, "radius": round(radius, 3),
-                                "_center": face_center,
-                            })
-                            print(f"[DebugCAD] S.A found {bend_angle}° bend.")
-            face_explorer.Next()
-        print(f"[BendV2] S.A processed {fillet_count} candidate faces.")
-
-        # ── Strategy B: Sharp-bend detection ──
-        sharp_count = 0
         for i in range(1, edge_face_map.Extent() + 1):
-            try:
-                f_list = edge_face_map.FindFromIndex(i)
-                faces = []
-                try:
-                    it = f_list.Iterator()
-                    while it.More():
-                        faces.append(it.Value())
-                        it.Next()
-                except:
-                    try: faces = list(f_list)
-                    except: pass
+            edge = edge_face_map.FindKey(i)
+            faces = _list_from_toptools_shape_list(edge_face_map.FindFromIndex(i))
+            if len(faces) < 2:
+                skipped_boundary += 1
+                continue
+            if len(faces) > 2:
+                skipped_non_manifold += 1
+                continue
 
-                if len(faces) != 2: continue
-                if _classify_face_type(faces[0]) == 'PLANE' and _classify_face_type(faces[1]) == 'PLANE':
-                    sharp_count += 1
-                    edge = edge_face_map.FindKey(i)
-                    mid = _edge_midpoint(edge)
-                    if not mid: continue
-                    n1 = _get_face_normal_at_point(faces[0], mid)
-                    n2 = _get_face_normal_at_point(faces[1], mid)
-                    if n1 and n2:
-                        dot = max(-1.0, min(1.0, n1.dot(n2)))
-                        theta = math.degrees(math.acos(dot))
-                        bend_angle = round(180.0 - theta, 1)
+            f1, f2 = faces[0], faces[1]
+            edge_pts = _edge_endpoints(edge)
+            if not edge_pts:
+                continue
+            p1, p2 = edge_pts
+            edge_len = _endpoint_distance(p1, p2)
+            if edge_len < 0.5:
+                continue
 
-                        if 2.0 <= bend_angle <= 178.0:
-                            pts = _edge_endpoints(edge)
-                            if not pts: continue
-                            direction = "UP" if n1.cross(n2).dot(part_centroid - mid) < 0 else "DOWN"
-                            raw_bends.append({
-                                "start": {"x": round(pts[0].x, 3), "y": round(pts[0].y, 3), "z": round(pts[0].z, 3)},
-                                "end": {"x": round(pts[1].x, 3), "y": round(pts[1].y, 3), "z": round(pts[1].z, 3)},
-                                "angle": bend_angle, "direction": direction, "radius": 0.0,
-                                "_center": mid,
-                            })
-                            print(f"[DebugCAD] S.B found {bend_angle}° sharp bend.")
-            except Exception as e:
-                print(f"[DebugCAD] S.B iteration error: {e}")
-        print(f"[BendV2] S.B processed {sharp_count} candidate edges.")
+            edge_mid = cq.Vector(
+                (p1.x + p2.x) * 0.5,
+                (p1.y + p2.y) * 0.5,
+                (p1.z + p2.z) * 0.5,
+            )
+            k1 = _face_key(f1)
+            k2 = _face_key(f2)
+            n1 = face_normal_cache.get(k1)
+            n2 = face_normal_cache.get(k2)
+            if n1 is None:
+                n1 = _get_face_normal_at_point(f1, edge_mid)
+                face_normal_cache[k1] = n1
+            if n2 is None:
+                n2 = _get_face_normal_at_point(f2, edge_mid)
+                face_normal_cache[k2] = n2
+            if not n1 or not n2:
+                continue
 
-        # ── Deduplication ──
-        for rb in raw_bends:
-            is_dup = False
-            ctr = rb["_center"]
-            for eb in bends:
-                if (ctr - eb["_center"]).Length < 3.0:
-                    is_dup = True
-                    if rb["radius"] > eb["radius"]: eb.update(rb)
-                    break
-            if not is_dup: bends.append(rb)
+            dot = max(-1.0, min(1.0, n1.dot(n2)))
+            if abs(dot) >= parallel_dot_tol:
+                continue
 
-        for b in bends: b.pop("_center", None)
-        print(f"[BendV2] Global Result: {len(bends)} bends.")
+            theta = math.degrees(math.acos(dot))
+            if abs(theta - 180.0) <= flat_tol_deg or abs(theta) <= flat_tol_deg:
+                continue
 
+            bend_angle = 180.0 - theta
+            if bend_angle < 2.0:
+                continue
+
+            edge_dir = (p2 - p1).normalized() if edge_len > 1e-9 else cq.Vector(1, 0, 0)
+            cross = n1.cross(n2)
+            signed = cross.dot(edge_dir)
+            direction = "UP" if signed >= 0 else "DOWN"
+
+            r1 = _get_cylinder_radius(f1)
+            r2 = _get_cylinder_radius(f2)
+            cyl_radii = [r for r in (r1, r2) if r is not None and r > 1e-6]
+            radius = round(min(cyl_radii), 3) if cyl_radii else _default_radius_from_thickness(thickness)
+
+            face_pair = _canonical_face_pair(f1, f2)
+            candidate_rows.append(
+                {
+                    "_face_pair": face_pair,
+                    "_start_v": p1,
+                    "_end_v": p2,
+                    "_edge_dir": edge_dir,
+                    "_edge_len": edge_len,
+                    "angle": round(bend_angle, 1),
+                    "direction": direction,
+                    "radius": radius,
+                }
+            )
+
+        if len(candidate_rows) == 0:
+            # Some STEP exports come in with fragmented/non-shared topology where
+            # edge->face adjacency is effectively empty. Fall back to the legacy
+            # cylindrical-face strategy instead of returning a hard 0 bends.
+            print("[BendV2] No adjacency candidates; falling back to legacy bend detection.")
+            return _extract_bend_features(shape)
+
+        # Group collinear splits: same adjacent faces + similar angle + same direction + connected.
+        grouped: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = {}
+        for row in candidate_rows:
+            angle_bucket = int(round(row["angle"] / angle_tol_group_deg))
+            key = (row["_face_pair"][0], row["_face_pair"][1], row["direction"], angle_bucket)
+            grouped.setdefault(key, []).append(row)
+
+        merged_rows: List[Dict[str, Any]] = []
+        for rows in grouped.values():
+            rows_sorted = sorted(
+                rows,
+                key=lambda r: (
+                    round(r["_start_v"].x, 3),
+                    round(r["_start_v"].y, 3),
+                    round(r["_start_v"].z, 3),
+                ),
+            )
+            consumed = [False] * len(rows_sorted)
+            for i, base in enumerate(rows_sorted):
+                if consumed[i]:
+                    continue
+                batch = [base]
+                consumed[i] = True
+                for j in range(i + 1, len(rows_sorted)):
+                    if consumed[j]:
+                        continue
+                    cand = rows_sorted[j]
+                    if abs(cand["angle"] - base["angle"]) > angle_tol_group_deg:
+                        continue
+                    if not _are_collinear(base["_edge_dir"], cand["_edge_dir"]):
+                        continue
+                    # Must touch within tolerance to be same bend line.
+                    d = min(
+                        _endpoint_distance(base["_start_v"], cand["_start_v"]),
+                        _endpoint_distance(base["_start_v"], cand["_end_v"]),
+                        _endpoint_distance(base["_end_v"], cand["_start_v"]),
+                        _endpoint_distance(base["_end_v"], cand["_end_v"]),
+                    )
+                    if d <= 1.0:
+                        batch.append(cand)
+                        consumed[j] = True
+
+                merged_rows.append(_merge_collinear_segments(batch))
+
+        # Stable ordering for frontend index-based hover coupling.
+        merged_rows.sort(
+            key=lambda r: (
+                round(r["_start_v"].x, 3),
+                round(r["_start_v"].y, 3),
+                round(r["_start_v"].z, 3),
+                round(r["_end_v"].x, 3),
+                round(r["_end_v"].y, 3),
+                round(r["_end_v"].z, 3),
+            )
+        )
+
+        bends: List[Dict[str, Any]] = []
+        for row in merged_rows:
+            bends.append(
+                {
+                    "start": {
+                        "x": round(row["_start_v"].x, 3),
+                        "y": round(row["_start_v"].y, 3),
+                        "z": round(row["_start_v"].z, 3),
+                    },
+                    "end": {
+                        "x": round(row["_end_v"].x, 3),
+                        "y": round(row["_end_v"].y, 3),
+                        "z": round(row["_end_v"].z, 3),
+                    },
+                    "angle": row["angle"],
+                    "direction": row["direction"],
+                    "radius": round(row["radius"], 3),
+                }
+            )
+
+        print(
+            f"[BendV2] candidates={len(candidate_rows)} merged={len(bends)} "
+            f"boundarySkipped={skipped_boundary} nonManifoldSkipped={skipped_non_manifold}"
+        )
+        return bends
     except Exception as e:
         print(f"[BendV2] Fatal: {e}")
         traceback.print_exc()
-
-    return bends
+        return []
 
 
 def _build_edge_face_map(shape_wrapped):
@@ -581,6 +772,65 @@ def _detect_thickness(shape: cq.Workplane) -> Optional[float]:
     except Exception as e:
         print(f"[Thickness] Error: {e}")
         return None
+
+
+def _validate_sheet_metal_shape(shape: cq.Workplane, thickness: Optional[float]) -> bool:
+    """
+    Basic sheet-metal validity checks:
+    - only planar/cylindrical surfaces
+    - reasonably constant thickness from parallel planar face pairs
+    """
+    if thickness is None or thickness <= 0:
+        return False
+
+    try:
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+
+        wrapped = shape.val().wrapped
+        planar_faces = []
+        exp = TopExp_Explorer(wrapped, TopAbs_FACE)
+        while exp.More():
+            face = exp.Current()
+            ftype = _classify_face_type(face)
+            if ftype not in ("PLANE", "CYLINDER"):
+                return False
+            if ftype == "PLANE":
+                plane = BRepAdaptor_Surface(face).Plane()
+                normal = plane.Axis().Direction()
+                loc = plane.Location()
+                planar_faces.append(
+                    {
+                        "normal": cq.Vector(normal.X(), normal.Y(), normal.Z()).normalized(),
+                        "location": cq.Vector(loc.X(), loc.Y(), loc.Z()),
+                    }
+                )
+            exp.Next()
+
+        if len(planar_faces) < 2:
+            return False
+
+        pair_dists = []
+        for i in range(len(planar_faces)):
+            for j in range(i + 1, len(planar_faces)):
+                n1 = planar_faces[i]["normal"]
+                n2 = planar_faces[j]["normal"]
+                if abs(abs(n1.dot(n2)) - 1.0) <= 0.01:
+                    dist = abs(
+                        n1.dot(planar_faces[i]["location"]) - n1.dot(planar_faces[j]["location"])
+                    )
+                    if 0.3 < dist < 15.0:
+                        pair_dists.append(dist)
+
+        if not pair_dists:
+            return False
+
+        tol = max(0.25, thickness * 0.35)
+        matches = [d for d in pair_dists if abs(d - thickness) <= tol]
+        return len(matches) >= max(1, int(0.4 * len(pair_dists)))
+    except Exception:
+        return False
 
 
 def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness: Optional[float]) -> Optional[Dict[str, Any]]:
@@ -741,6 +991,10 @@ def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness
                 f'stroke-width="{max(0.1, vb_w * 0.002):.4f}" '
                 f'stroke-linecap="round" stroke-linejoin="round" />'
             )
+
+        bb = shape.val().BoundingBox()
+        lens = [bb.xlen, bb.ylen, bb.zlen]
+        thin_axis = lens.index(min(lens))
 
         # Project bend lines onto the same 2D plane
         bend_lines_2d = []
@@ -915,15 +1169,16 @@ app.add_middleware(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _count_triangles(stl_bytes: bytes) -> int:
-    """Parse binary STL header to extract triangle count.
-
-    Binary STL layout:
-      [0:80]   80-byte ASCII header (ignored)
-      [80:84]  uint32 LE – triangle count
-      [84:]    N × 50-byte triangle records
-    """
+    """Parse STL header to extract triangle count. Handles binary and ASCII."""
     if len(stl_bytes) < 84:
         return 0
+    
+    # ASCII STL check: starts with 'solid'
+    if stl_bytes.startswith(b"solid"):
+        # For simplicity, return 0 for ASCII or do a basic line count
+        # Three.js will still render it fine, this is just for the metadata log
+        return 0
+        
     (count,) = struct.unpack_from("<I", stl_bytes, 80)
     return count
 
@@ -996,7 +1251,10 @@ def _convert_step_to_stl(step_bytes: bytes) -> dict:
 
         # ── Feature Extraction ───────────────────────────────────────────────
         hole_features = _extract_hole_features(shape)
-        bend_features = _extract_bend_features(shape)
+        # Use V2 bend detection by default for better reliability
+        bend_features = _extract_bend_features_v2(shape)
+        thickness = _detect_thickness(shape)
+        flat_pattern = _generate_flat_pattern_svg(shape, bend_features, thickness)
 
         return {
             "stl": stl_b64,
@@ -1004,6 +1262,8 @@ def _convert_step_to_stl(step_bytes: bytes) -> dict:
             "boundingBox": bounding_box,
             "holes": hole_features,
             "bends": bend_features,
+            "detectedThickness": thickness,
+            "flatPattern": flat_pattern,
         }
 
     finally:
@@ -1076,13 +1336,15 @@ async def convert(file: UploadFile = File(...)) -> JSONResponse:
             detail=f"File too large ({size_mb:.1f} MB). Maximum is 100 MB.",
         )
 
-    # ── Convert ───────────────────────────────────────────────────────────────
+    # ── Convert & Analyze ───────────────────────────────────────────────────
     try:
         result = _convert_step_to_stl(content)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         print(f"[convert] Unexpected error: {exc}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Conversion failed: {exc}",
@@ -1091,51 +1353,3 @@ async def convert(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(content=result)
 
 
-@app.post("/analyze-bends", tags=["analysis"])
-async def analyze_bends(file: UploadFile = File(...)) -> JSONResponse:
-    """Analyze a STEP file for sheet metal bends, thickness, and flat pattern.
-
-    Accepts: multipart/form-data with field name `file`.
-    Returns:
-    ```json
-    {
-      "bends": [...],
-      "detectedThickness": 1.5,
-      "flatPattern": { "svg": "...", "viewBox": {...}, "bendLines": [...] },
-      "boundingBox": { "x": ..., "y": ..., "z": ... }
-    }
-    ```
-    """
-    # ── Validate ───────────────────────────────────────────────────────────────
-    filename: str = file.filename or "upload"
-    ext = os.path.splitext(filename.lower())[1]
-    if ext not in ACCEPTED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f'Unsupported file type "{ext}". Please upload a .step or .stp file.',
-        )
-
-    content = await file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="Empty file received.")
-    if len(content) > MAX_FILE_SIZE:
-        size_mb = len(content) / 1_048_576
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large ({size_mb:.1f} MB). Maximum is 100 MB.",
-        )
-
-    # ── Analyze ────────────────────────────────────────────────────────────────
-    try:
-        result = _analyze_step_bends(content)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        print(f"[analyze-bends] Unexpected error: {exc}")
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Bend analysis failed: {exc}",
-        ) from exc
-
-    return JSONResponse(content=result)
