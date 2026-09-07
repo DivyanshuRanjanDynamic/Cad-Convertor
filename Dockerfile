@@ -26,7 +26,9 @@ USER root
 RUN python -m pip install --no-cache-dir \
     fastapi==0.111.0 \
     uvicorn[standard]==0.29.0 \
-    python-multipart==0.0.9
+    python-multipart==0.0.9 \
+    google-cloud-firestore==2.16.0 \
+    boto3==1.34.100
 
 # ── Application Setup ────────────────────────────────────────────────────────
 WORKDIR /app

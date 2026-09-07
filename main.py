@@ -13,6 +13,7 @@ TypeScript interface in the MechHub studio frontend.
 
 import base64
 from collections import Counter
+import datetime
 import io
 import math
 import os
@@ -20,11 +21,13 @@ import struct
 import tempfile
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from threading import Lock
 from typing import Optional, List, Dict, Any, Tuple
 
 import cadquery as cq
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -1490,6 +1493,169 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+# ── Async Conversion Job Store & S3 Helpers ─────────────────────────────────────
+
+class ConversionJobStore:
+    """
+    Manages conversion job states in Firestore 'conversionJobs' collection,
+    with an in-memory thread-safe dictionary fallback for local development.
+    """
+
+    def __init__(self):
+        self._memory_store: Dict[str, Dict[str, Any]] = {}
+        self._lock = Lock()
+        self._db = None
+
+        try:
+            project_id = (
+                os.getenv("FIREBASE_PROJECT_ID")
+                or os.getenv("GCP_PROJECT")
+                or os.getenv("GOOGLE_CLOUD_PROJECT")
+            )
+            from google.cloud import firestore
+
+            if project_id:
+                self._db = firestore.Client(project=project_id)
+                print(f"[JobStore] Firestore client connected for project: {project_id}")
+            else:
+                self._db = firestore.Client()
+                print("[JobStore] Firestore client connected with default credentials")
+        except Exception as exc:
+            print(f"[JobStore] Firestore initialization skipped (using in-memory store): {exc}")
+
+    def create_job(self, job_id: str, file_name: str, file_size: int) -> dict:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        job_data = {
+            "jobId": job_id,
+            "status": "queued",
+            "fileName": file_name,
+            "fileSize": file_size,
+            "createdAt": now,
+            "updatedAt": now,
+            "fileUrl": None,
+            "resultUrl": None,
+            "result": None,
+            "error": None,
+        }
+
+        with self._lock:
+            self._memory_store[job_id] = job_data.copy()
+
+        if self._db:
+            try:
+                self._db.collection("conversionJobs").document(job_id).set(job_data)
+            except Exception as exc:
+                print(f"[JobStore] Error writing job to Firestore: {exc}")
+
+        return job_data
+
+    def update_job(self, job_id: str, updates: dict) -> dict:
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        updates["updatedAt"] = now
+
+        with self._lock:
+            if job_id in self._memory_store:
+                self._memory_store[job_id].update(updates)
+                current = self._memory_store[job_id].copy()
+            else:
+                current = updates.copy()
+                self._memory_store[job_id] = current
+
+        if self._db:
+            try:
+                self._db.collection("conversionJobs").document(job_id).update(updates)
+            except Exception as exc:
+                print(f"[JobStore] Error updating job in Firestore: {exc}")
+
+        return current
+
+    def get_job(self, job_id: str) -> Optional[dict]:
+        with self._lock:
+            if job_id in self._memory_store:
+                return self._memory_store[job_id].copy()
+
+        if self._db:
+            try:
+                doc = self._db.collection("conversionJobs").document(job_id).get()
+                if doc.exists:
+                    data = doc.to_dict()
+                    with self._lock:
+                        self._memory_store[job_id] = data.copy()
+                    return data
+            except Exception as exc:
+                print(f"[JobStore] Error reading job from Firestore: {exc}")
+
+        return None
+
+
+job_store = ConversionJobStore()
+
+
+def _upload_to_s3(file_bytes: bytes, key: str, content_type: str = "application/octet-stream") -> Optional[str]:
+    """Uploads file bytes to AWS S3 if credentials & bucket are present."""
+    bucket_name = os.getenv("AWS_S3_BUCKET") or os.getenv("S3_BUCKET_NAME")
+    region = os.getenv("AWS_REGION", "eu-north-1")
+
+    if not bucket_name:
+        return None
+
+    try:
+        import boto3
+        s3_client = boto3.client("s3", region_name=region)
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=key,
+            Body=file_bytes,
+            ContentType=content_type
+        )
+        url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}"
+        print(f"[S3] Successfully uploaded {key} to {url}")
+        return url
+    except Exception as exc:
+        print(f"[S3] Upload warning for {key}: {exc}")
+        return None
+
+
+def _process_conversion_job_bg(job_id: str, step_bytes: bytes, filename: str):
+    """Background task executing the CadQuery conversion and updating job status."""
+    print(f"[Async Job {job_id}] Processing started for '{filename}' ({len(step_bytes):,} bytes)...")
+    job_store.update_job(job_id, {"status": "processing"})
+
+    try:
+        # Optionally upload original STEP file to S3
+        step_s3_url = _upload_to_s3(step_bytes, f"cad_uploads/{job_id}/{filename}", "application/step")
+        if step_s3_url:
+            job_store.update_job(job_id, {"fileUrl": step_s3_url})
+
+        # Core CadQuery conversion
+        result = _convert_step_to_stl(step_bytes)
+
+        # Upload generated STL file to S3 if available
+        stl_s3_url = None
+        if result.get("stl"):
+            try:
+                stl_raw = base64.b64decode(result["stl"])
+                stl_s3_url = _upload_to_s3(stl_raw, f"cad_outputs/{job_id}.stl", "model/stl")
+            except Exception as exc:
+                print(f"[Async Job {job_id}] Could not upload STL to S3: {exc}")
+
+        job_store.update_job(job_id, {
+            "status": "done",
+            "result": result,
+            "resultUrl": stl_s3_url,
+        })
+        print(f"[Async Job {job_id}] Completed successfully!")
+
+    except Exception as exc:
+        err_text = str(exc)
+        print(f"[Async Job {job_id}] Failed: {err_text}")
+        traceback.print_exc()
+        job_store.update_job(job_id, {
+            "status": "failed",
+            "error": err_text,
+        })
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["ops"])
@@ -1501,7 +1667,8 @@ def root() -> dict:
         "version": app.version,
         "endpoints": {
             "health": "/health",
-            "convert": "/convert [POST]"
+            "convert": "/convert [POST]",
+            "status": "/status/{jobId} [GET]",
         }
     }
 
@@ -1513,20 +1680,17 @@ def health() -> dict:
 
 
 @app.post("/convert", tags=["conversion"])
-async def convert(file: UploadFile = File(...)) -> JSONResponse:
+async def convert(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    sync: bool = Query(False, description="Set to true for synchronous conversion")
+) -> JSONResponse:
     """Convert an uploaded STEP file to a base64-encoded binary STL.
 
-    Accepts: multipart/form-data with field name `file`.
-    Returns:
-    ```json
-    {
-      "stl": "<base64 binary STL>",
-      "triangleCount": 12345,
-      "boundingBox": { "x": 100.0, "y": 50.0, "z": 25.0 }
-    }
-    ```
+    Default mode: Asynchronous HTTP 202 returning `{ "jobId": "...", "status": "queued" }`.
+    The client polls `/status/{jobId}` until completed.
+    Pass `?sync=true` for direct inline conversion.
     """
-    # ── Validate file extension ───────────────────────────────────────────────
     filename: str = file.filename or "upload"
     ext = os.path.splitext(filename.lower())[1]
     if ext not in ACCEPTED_EXTENSIONS:
@@ -1535,7 +1699,6 @@ async def convert(file: UploadFile = File(...)) -> JSONResponse:
             detail=f'Unsupported file type "{ext}". Please upload a .step or .stp file.',
         )
 
-    # ── Read and size-check ───────────────────────────────────────────────────
     content = await file.read()
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="Empty file received.")
@@ -1546,20 +1709,42 @@ async def convert(file: UploadFile = File(...)) -> JSONResponse:
             detail=f"File too large ({size_mb:.1f} MB). Maximum is 100 MB.",
         )
 
-    # ── Convert & Analyze ───────────────────────────────────────────────────
-    try:
-        result = _convert_step_to_stl(content)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover
-        print(f"[convert] Unexpected error: {exc}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Conversion failed: {exc}",
-        ) from exc
+    # ── Synchronous override fallback ───────────────────────────────────────
+    if sync:
+        try:
+            result = _convert_step_to_stl(content)
+            return JSONResponse(content=result)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            print(f"[convert sync] Error: {exc}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}") from exc
 
-    return JSONResponse(content=result)
+    # ── Default Async Flow ──────────────────────────────────────────────────
+    job_id = uuid.uuid4().hex
+    job_store.create_job(job_id, filename, len(content))
+    background_tasks.add_task(_process_conversion_job_bg, job_id, content, filename)
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "jobId": job_id,
+            "status": "queued",
+            "fileName": filename,
+            "fileSize": len(content),
+            "createdAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        },
+    )
+
+
+@app.get("/status/{job_id}", tags=["conversion"])
+def get_job_status(job_id: str) -> JSONResponse:
+    """Retrieve async CAD conversion job status and result payload."""
+    job = job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return JSONResponse(content=job)
+
 
 
