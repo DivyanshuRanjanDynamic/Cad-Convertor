@@ -1512,15 +1512,33 @@ class ConversionJobStore:
                 or os.getenv("GCP_PROJECT")
                 or os.getenv("GOOGLE_CLOUD_PROJECT")
             )
-            from google.cloud import firestore
+            client_email = os.getenv("FIREBASE_CLIENT_EMAIL")
+            private_key = os.getenv("FIREBASE_PRIVATE_KEY")
 
             if project_id:
-                self._db = firestore.Client(project=project_id)
-                print(f"[JobStore] Firestore client connected for project: {project_id}")
+                from google.cloud import firestore
+
+                if client_email and private_key:
+                    from google.oauth2 import service_account
+
+                    formatted_key = private_key.replace("\\n", "\n")
+                    info = {
+                        "type": "service_account",
+                        "project_id": project_id,
+                        "client_email": client_email,
+                        "private_key": formatted_key,
+                    }
+                    creds = service_account.Credentials.from_service_account_info(info)
+                    self._db = firestore.Client(project=project_id, credentials=creds)
+                    print(f"[JobStore] Firestore client connected with service account for project: {project_id}")
+                else:
+                    self._db = firestore.Client(project=project_id)
+                    print(f"[JobStore] Firestore client connected for project: {project_id}")
             else:
-                self._db = firestore.Client()
-                print("[JobStore] Firestore client connected with default credentials")
+                print("[JobStore] No project_id found, using thread-safe in-memory store.")
+                self._db = None
         except Exception as exc:
+            self._db = None
             print(f"[JobStore] Firestore initialization skipped (using in-memory store): {exc}")
 
     def create_job(self, job_id: str, file_name: str, file_size: int) -> dict:
