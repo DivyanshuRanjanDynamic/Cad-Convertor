@@ -5,7 +5,12 @@ FastAPI + CadQuery (OCCT Python bindings)
 Endpoints:
   GET  /health          → liveness probe
   POST /convert         → multipart STEP file → JSON (base64 STL + metadata)
+                          [signed upload ticket from the web app, or service token]
   POST /analyze-bends   → multipart STEP file → JSON (bend analysis + flat pattern SVG)
+  POST /analyze-cnc     → multipart STEP file → JSON (stock, setups, process, machining time, DFM)
+                          [service token required]
+  POST /internal/analyze-cnc → { fileUrl, fileName } (presigned S3 URL) → same JSON
+                          [service token required — called by the web app's server only]
 
 Response is 100% contract-compatible with the existing ConversionResult
 TypeScript interface in the MechHub studio frontend.
@@ -27,9 +32,16 @@ from threading import Lock
 from typing import Optional, List, Dict, Any, Tuple
 
 import cadquery as cq
-from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query
+from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+
+from pydantic import BaseModel, Field
+
+from cnc_analysis import analyze_step_cnc
+from service_auth import require_service_token, validate_file_url, fetch_file
+from convert_access import ConvertQuota, RequireCallerMiddleware, authorize_convert
 
 # ── Feature Extraction ────────────────────────────────────────────────────────
 
@@ -1363,6 +1375,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Reject unauthorised /convert uploads before their body is read. Registered
+# before CORS so CORS stays outermost (preflights + CORS headers on 401s).
+def _service_only(authorization: str) -> str:
+    require_service_token(authorization)
+    return "service"
+
+
+app.add_middleware(
+    RequireCallerMiddleware,
+    paths={
+        "/convert": authorize_convert,
+        "/analyze-cnc": _service_only,
+        "/internal/analyze-cnc": _service_only,
+    },
+)
+convert_quota = ConvertQuota.from_env()
+
 # CORS — allow the MechHub web app (production + local dev) to call directly.
 # Restrict `allow_origins` to specific domains in production for tighter security.
 allowed_origins = os.getenv(
@@ -1674,6 +1703,14 @@ def _process_conversion_job_bg(job_id: str, step_bytes: bytes, filename: str):
         })
 
 
+def _run_conversion_job(job_id: str, step_bytes: bytes, filename: str, caller: str):
+    """Background job wrapper that always frees the caller's quota slot."""
+    try:
+        _process_conversion_job_bg(job_id, step_bytes, filename)
+    finally:
+        convert_quota.release(caller)
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["ops"])
@@ -1686,6 +1723,8 @@ def root() -> dict:
         "endpoints": {
             "health": "/health",
             "convert": "/convert [POST]",
+            "analyzeCnc": "/analyze-cnc [POST, service token]",
+            "analyzeCncInternal": "/internal/analyze-cnc [POST, service token]",
             "status": "/status/{jobId} [GET]",
         }
     }
@@ -1697,18 +1736,8 @@ def health() -> dict:
     return {"status": "ok", "version": app.version}
 
 
-@app.post("/convert", tags=["conversion"])
-async def convert(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    sync: bool = Query(False, description="Set to true for synchronous conversion")
-) -> JSONResponse:
-    """Convert an uploaded STEP file to a base64-encoded binary STL.
-
-    Default mode: Asynchronous HTTP 202 returning `{ "jobId": "...", "status": "queued" }`.
-    The client polls `/status/{jobId}` until completed.
-    Pass `?sync=true` for direct inline conversion.
-    """
+async def _read_step_upload(file: UploadFile) -> Tuple[str, bytes]:
+    """Validate extension and size of an uploaded STEP file; return (name, bytes)."""
     filename: str = file.filename or "upload"
     ext = os.path.splitext(filename.lower())[1]
     if ext not in ACCEPTED_EXTENSIONS:
@@ -1726,11 +1755,37 @@ async def convert(
             status_code=413,
             detail=f"File too large ({size_mb:.1f} MB). Maximum is 100 MB.",
         )
+    return filename, content
+
+
+@app.post("/convert", tags=["conversion"])
+async def convert(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    sync: bool = Query(False, description="Set to true for synchronous conversion")
+) -> JSONResponse:
+    """Convert an uploaded STEP file to a base64-encoded binary STL.
+
+    Default mode: Asynchronous HTTP 202 returning `{ "jobId": "...", "status": "queued" }`.
+    The client polls `/status/{jobId}` until completed.
+    Pass `?sync=true` for direct inline conversion.
+
+    Requires `Authorization: Bearer <ticket>` (checked by RequireCallerMiddleware);
+    each caller is limited by `convert_quota`.
+    """
+    caller = getattr(request.state, "caller", None)
+    if not caller:  # middleware not in front of this route — fail closed
+        raise HTTPException(status_code=401, detail="Sign in to convert CAD files.")
+
+    filename, content = await _read_step_upload(file)
+    convert_quota.acquire(caller)
 
     # ── Synchronous override fallback ───────────────────────────────────────
     if sync:
         try:
-            result = _convert_step_to_stl(content)
+            # OCCT work is CPU-bound — keep it off the event loop.
+            result = await run_in_threadpool(_convert_step_to_stl, content)
             return JSONResponse(content=result)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1738,11 +1793,17 @@ async def convert(
             print(f"[convert sync] Error: {exc}")
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}") from exc
+        finally:
+            convert_quota.release(caller)
 
     # ── Default Async Flow ──────────────────────────────────────────────────
-    job_id = uuid.uuid4().hex
-    job_store.create_job(job_id, filename, len(content))
-    background_tasks.add_task(_process_conversion_job_bg, job_id, content, filename)
+    try:
+        job_id = uuid.uuid4().hex
+        job_store.create_job(job_id, filename, len(content))
+        background_tasks.add_task(_run_conversion_job, job_id, content, filename, caller)
+    except Exception:
+        convert_quota.release(caller)
+        raise
 
     return JSONResponse(
         status_code=202,
@@ -1765,4 +1826,61 @@ def get_job_status(job_id: str) -> JSONResponse:
     return JSONResponse(content=job)
 
 
+async def _run_cnc_analysis(filename: str, content: bytes) -> JSONResponse:
+    try:
+        # OCCT work is CPU-bound — keep it off the event loop.
+        result = await run_in_threadpool(analyze_step_cnc, content)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[analyze-cnc] Error on {filename}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"CNC analysis failed: {exc}") from exc
 
+    print(
+        f"[analyze-cnc] OK — {filename}: {result['process']['recommended']}, "
+        f"{result['setups']['count']} setups, {result['analysisMs']} ms"
+    )
+    return JSONResponse(content=result)
+
+
+@app.post("/analyze-cnc", tags=["costing"], dependencies=[Depends(require_service_token)])
+async def analyze_cnc(file: UploadFile = File(...)) -> JSONResponse:
+    """Analyse an uploaded STEP part for CNC costing (service token required).
+
+    Returns stock selection, removed volume, setup count, turning detection,
+    per-material machining-time estimates and DFM issues. Material-agnostic:
+    the web app prices any material / quantity from one analysis.
+    """
+    filename, content = await _read_step_upload(file)
+    return await _run_cnc_analysis(filename, content)
+
+
+class AnalyzeCncUrlRequest(BaseModel):
+    fileUrl: str = Field(..., min_length=1, max_length=4096)
+    fileName: str = Field(..., min_length=1, max_length=255)
+
+
+@app.post(
+    "/internal/analyze-cnc",
+    tags=["costing"],
+    dependencies=[Depends(require_service_token)],
+)
+async def analyze_cnc_from_url(body: AnalyzeCncUrlRequest) -> JSONResponse:
+    """Analyse a STEP part the web app uploaded to S3 (service token required).
+
+    The web app authenticates the customer, presigns a short-lived GET URL for
+    their upload and calls here; the file never passes through the web app.
+    """
+    ext = os.path.splitext(body.fileName.lower())[1]
+    if ext not in ACCEPTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Unsupported file type "{ext}". Please upload a .step or .stp file.',
+        )
+    validate_file_url(body.fileUrl)
+
+    content = await run_in_threadpool(fetch_file, body.fileUrl, MAX_FILE_SIZE)
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+    return await _run_cnc_analysis(body.fileName, content)
