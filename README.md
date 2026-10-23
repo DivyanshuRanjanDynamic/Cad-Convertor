@@ -204,6 +204,14 @@ python -m unittest discover -s tests -v
      - `CONVERTER_SERVICE_TOKEN`: Matches the production studio's secret.
      - `CORS_ORIGINS`: Comma-separated domains (e.g. `https://mechhub.in,https://studio.mechhub.in`).
      - `FILE_URL_ALLOWED_HOSTS`: `.amazonaws.com` (or your S3 bucket endpoint).
+     - `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`: the same service account the studio uses. Conversion jobs are then kept in Firestore (`conversionJobs`), so any replica can answer a `/status` poll. Without them the converter falls back to an in-memory job store, which only works with a single replica.
+
+   **Running two replicas (no downtime on restarts or deploys):**
+   1. Set the three `FIREBASE_*` variables above and deploy.
+   2. Check `GET https://<converter-domain>/health` returns `"jobStore": "firestore"`.
+   3. Then set `numReplicas = 2` in `railway.toml` and deploy again.
+
+   Rate limits (`CONVERT_MAX_*`) are kept per replica, so with two replicas the effective limits double; halve them if you want the same totals.
 
 4. **Link to Next.js Studio:**
    Update your Next.js production environment variables:
@@ -226,3 +234,5 @@ python -m unittest discover -s tests -v
 | `CONVERT_MAX_ACTIVE_PER_USER` | `2` | Max concurrent conversions allowed for a single user. |
 | `CONVERT_MAX_ACTIVE_JOBS` | `6` | Global maximum concurrent conversions across all users. |
 | `FILE_URL_ALLOWED_HOSTS` | `.amazonaws.com` | Allowed hostname suffixes for presigned URLs in `/internal/analyze-cnc`. |
+| `FIREBASE_PROJECT_ID` | *None* | Firestore project for the conversion job store. Unset ⇒ in-memory store (single replica only); `/health` reports which is in use. |
+| `FIREBASE_CLIENT_EMAIL` / `FIREBASE_PRIVATE_KEY` | *None* | Service-account credentials for that project. |

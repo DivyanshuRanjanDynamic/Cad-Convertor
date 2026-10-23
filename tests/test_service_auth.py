@@ -161,5 +161,61 @@ class CncEndpointsTest(unittest.TestCase):
         fetch.assert_not_called()
 
 
+@unittest.skipIf(main is None, "CadQuery / OCP not installed")
+class SheetAndPrintEndpointsTest(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"CONVERTER_SERVICE_TOKEN": TOKEN})
+        self.env.start()
+        self.client = TestClient(main.app)
+        self.auth = {"Authorization": f"Bearer {TOKEN}"}
+
+    def tearDown(self):
+        self.env.stop()
+
+    def test_sheet_endpoint_needs_token_and_a_step_file(self):
+        body = {"fileUrl": S3_URL, "fileName": "bracket.step"}
+        self.assertEqual(self.client.post("/internal/analyze-sheet", json=body).status_code, 401)
+        with mock.patch.object(main, "analyze_step_sheet", return_value={"version": "sheet-1", "analysisMs": 3}) as run, \
+                mock.patch.object(main, "fetch_file", return_value=b"ISO-10303-21;"):
+            res = self.client.post("/internal/analyze-sheet", json=body, headers=self.auth)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.json()["version"], "sheet-1")
+        run.assert_called_once_with(b"ISO-10303-21;", main._extract_bend_features_v2)
+
+        with mock.patch.object(main, "fetch_file") as fetch:
+            stl = self.client.post(
+                "/internal/analyze-sheet", json={"fileUrl": S3_URL, "fileName": "p.stl"}, headers=self.auth
+            )
+        self.assertEqual(stl.status_code, 400)
+        fetch.assert_not_called()
+
+    def test_print_endpoint_accepts_meshes_and_reports_bad_geometry(self):
+        cube_stl = (
+            "solid c\n"
+            + "".join(
+                "facet normal 0 0 0\nouter loop\n" + "".join(f"vertex {x} {y} {z}\n" for x, y, z in t) + "endloop\nendfacet\n"
+                for t in [
+                    ((0, 0, 0), (0, 10, 0), (10, 10, 0)), ((0, 0, 0), (10, 10, 0), (10, 0, 0)),
+                    ((0, 0, 10), (10, 0, 10), (10, 10, 10)), ((0, 0, 10), (10, 10, 10), (0, 10, 10)),
+                    ((0, 0, 0), (10, 0, 0), (10, 0, 10)), ((0, 0, 0), (10, 0, 10), (0, 0, 10)),
+                    ((10, 0, 0), (10, 10, 0), (10, 10, 10)), ((10, 0, 0), (10, 10, 10), (10, 0, 10)),
+                    ((10, 10, 0), (0, 10, 0), (0, 10, 10)), ((10, 10, 0), (0, 10, 10), (10, 10, 10)),
+                    ((0, 10, 0), (0, 0, 0), (0, 0, 10)), ((0, 10, 0), (0, 0, 10), (0, 10, 10)),
+                ]
+            )
+            + "endsolid c\n"
+        ).encode()
+        body = {"fileUrl": S3_URL, "fileName": "cube.stl"}
+        self.assertEqual(self.client.post("/internal/analyze-print", json=body).status_code, 401)
+        with mock.patch.object(main, "fetch_file", return_value=cube_stl):
+            res = self.client.post("/internal/analyze-print", json=body, headers=self.auth)
+        self.assertEqual(res.status_code, 200)
+        self.assertAlmostEqual(res.json()["volumeMm3"], 1000, delta=0.1)
+
+        with mock.patch.object(main, "fetch_file", return_value=b"solid empty\nendsolid\n"):
+            bad = self.client.post("/internal/analyze-print", json=body, headers=self.auth)
+        self.assertEqual(bad.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

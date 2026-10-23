@@ -35,7 +35,7 @@ WORKDIR /app
 
 # Copy application code and ensure the 'cq' user owns it.
 # The base image provides the 'cq' user for secure execution.
-COPY --chown=cq:cq main.py cnc_analysis.py cnc_model.py service_auth.py convert_access.py ./
+COPY --chown=cq:cq main.py cnc_analysis.py cnc_model.py sheet_analysis.py print_analysis.py service_auth.py convert_access.py ./
 
 # Switch to non-privileged user for runtime security.
 USER cq

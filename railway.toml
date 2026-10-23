@@ -10,6 +10,10 @@ healthcheckPath = "/health"
 healthcheckTimeout = 180   # OCCT warm-up can take ~30-60s on first start
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+# Raise to 2 only once production's GET /health reports "jobStore": "firestore".
+# With the in-memory store, a /status poll that reaches the other replica can't
+# find the job. Needs FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL and
+# FIREBASE_PRIVATE_KEY set on this service (see README → Deployment).
 numReplicas = 1
 
 [deploy.resources]

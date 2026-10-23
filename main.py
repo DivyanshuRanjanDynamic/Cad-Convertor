@@ -32,6 +32,10 @@ from threading import Lock
 from typing import Optional, List, Dict, Any, Tuple
 
 import cadquery as cq
+import ezdxf
+from cadquery.occ_impl.importers.dxf import _dxf_convert
+from OCP.BRepClass import BRepClass_FaceClassifier
+from OCP.TopAbs import TopAbs_IN
 from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
@@ -40,6 +44,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from cnc_analysis import analyze_step_cnc
+from print_analysis import analyze_print_file
+from sheet_analysis import analyze_sheet_workplane, analyze_step_sheet
 from service_auth import require_service_token, validate_file_url, fetch_file
 from convert_access import ConvertQuota, RequireCallerMiddleware, authorize_convert
 
@@ -263,12 +269,13 @@ def _get_face_normal_at_point(face, point):
     Returns cq.Vector or None.
     """
     try:
-        from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.BRep import BRep_Tool
         from OCP.gp import gp_Pnt
         from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 
-        adaptor = BRepAdaptor_Surface(face)
-        surf = adaptor.Surface()
+        # The projector needs a Handle(Geom_Surface); BRepAdaptor_Surface.Surface()
+        # returns a GeomAdaptor_Surface, which current OCP rejects.
+        surf = BRep_Tool.Surface_s(face)
 
         # Project point onto surface to get (u, v) parameters
         projector = GeomAPI_ProjectPointOnSurf(
@@ -380,10 +387,12 @@ def _shape_to_faces(shape_wrapped):
     from OCP.TopAbs import TopAbs_FACE
     from OCP.TopExp import TopExp_Explorer
 
+    from OCP.TopoDS import TopoDS
+
     out = []
     exp = TopExp_Explorer(shape_wrapped, TopAbs_FACE)
     while exp.More():
-        out.append(exp.Current())
+        out.append(TopoDS.Face_s(exp.Current()))
         exp.Next()
     return out
 
@@ -404,7 +413,13 @@ def _list_from_toptools_shape_list(shape_list) -> List[Any]:
 
 
 def _face_key(face) -> str:
-    return str(hash(face))
+    """Same key for the same face however it was reached (explorer, edge map).
+    OCCT ≤ 7.7 (production image) hashes Python wrappers by identity and offers
+    HashCode(); OCCT 7.8 dropped HashCode and made __hash__ topology-based."""
+    try:
+        return str(face.HashCode(2147483647))
+    except AttributeError:
+        return str(hash(face))
 
 
 def _canonical_face_pair(f1, f2) -> Tuple[str, str]:
@@ -450,6 +465,83 @@ def _face_midpoint(face) -> Optional[cq.Vector]:
         v = 0.5 * (adaptor.FirstVParameter() + adaptor.LastVParameter())
         p = adaptor.Value(u, v)
         return cq.Vector(p.X(), p.Y(), p.Z())
+    except Exception:
+        return None
+
+
+def _is_edge_wall(face, thickness: Optional[float]) -> bool:
+    """
+    True for the thin faces that close off a sheet's cut edges (and hole walls).
+    Such a face is a strip one thickness wide, so 2·area/perimeter ≈ thickness;
+    the skins and bend faces of the sheet are far wider than that.
+    """
+    if not thickness or thickness <= 0:
+        return False
+    try:
+        f = cq.Face(face)
+        perimeter = sum(e.Length() for e in f.Edges())
+        if perimeter <= 1e-9:
+            return False
+        return 2.0 * f.Area() / perimeter <= 1.25 * thickness
+    except Exception:
+        return False
+
+
+def _cylinder_bend_row(
+    face, part_centroid: cq.Vector, thickness: Optional[float]
+) -> Optional[Dict[str, Any]]:
+    """
+    Bend candidate for a radiused bend's cylindrical skin face. Its edges with
+    the neighbouring flats are tangent, so edge adjacency can't see it; read
+    the bend off the cylinder instead (same conventions as the legacy detector:
+    line on the bend axis, angle = angular span).
+    """
+    try:
+        from OCP.BRepAdaptor import BRepAdaptor_Surface
+
+        adaptor = BRepAdaptor_Surface(face)
+        cyl = adaptor.Cylinder()
+        radius = cyl.Radius()
+        u_min, u_max = adaptor.FirstUParameter(), adaptor.LastUParameter()
+        v_min, v_max = adaptor.FirstVParameter(), adaptor.LastVParameter()
+        angle = math.degrees(abs(u_max - u_min))
+        if angle < 2.0 or angle > 185.0:
+            return None
+
+        pos = cyl.Position()
+        loc = pos.Location()
+        d = pos.Direction()
+        axis_dir = cq.Vector(d.X(), d.Y(), d.Z())
+        axis_loc = cq.Vector(loc.X(), loc.Y(), loc.Z())
+        p1 = axis_loc + axis_dir * v_min
+        p2 = axis_loc + axis_dir * v_max
+
+        # The bend opens toward its axis. Inner and outer skins share that
+        # side, so both faces of one bend get the same direction.
+        axis_mid = (p1 + p2) * 0.5
+        mid = adaptor.Value(0.5 * (u_min + u_max), 0.5 * (v_min + v_max))
+        to_arc = cq.Vector(mid.X(), mid.Y(), mid.Z()) - axis_mid
+        to_centroid = part_centroid - axis_mid
+        direction = "DOWN" if to_arc.dot(to_centroid) < 0 else "UP"
+
+        # Report the inner bend radius for both skins: the outer (convex) one
+        # sits a thickness further from the axis.
+        mid_v = cq.Vector(mid.X(), mid.Y(), mid.Z())
+        normal = _get_face_normal_at_point(face, mid_v)
+        if normal is not None and normal.dot(to_arc) > 0 and thickness and radius - thickness > 0:
+            radius -= thickness
+
+        key = _face_key(face)
+        return {
+            "_face_pair": (key, key),
+            "_start_v": p1,
+            "_end_v": p2,
+            "_edge_dir": axis_dir,
+            "_edge_len": abs(v_max - v_min),
+            "angle": round(angle, 1),
+            "direction": direction,
+            "radius": round(radius, 3),
+        }
     except Exception:
         return None
 
@@ -748,11 +840,22 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
     bend edge = edge with exactly two adjacent faces whose normals are not parallel.
     """
     try:
+        from OCP.TopoDS import TopoDS
+
         wrapped = shape.val().wrapped
         edge_face_map = _build_edge_face_map(wrapped)
         thickness = _detect_thickness(shape)
 
-        face_types = Counter(_classify_face_type(face) for face in _shape_to_faces(wrapped))
+        all_faces = _shape_to_faces(wrapped)
+        face_type_by_key: Dict[str, str] = {}
+        wall_keys = set()
+        for face in all_faces:
+            k = _face_key(face)
+            face_type_by_key[k] = _classify_face_type(face)
+            if _is_edge_wall(face, thickness):
+                wall_keys.add(k)
+
+        face_types = Counter(face_type_by_key[_face_key(face)] for face in all_faces)
         non_sheet_faces = sum(
             count for ft, count in face_types.items() if ft not in ("PLANE", "CYLINDER")
         )
@@ -771,11 +874,24 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
         candidate_rows: List[Dict[str, Any]] = []
         skipped_non_manifold = 0
         skipped_boundary = 0
+        skipped_wall = 0
+        # Only planar normals are constant over the face, so only those are cached.
         face_normal_cache: Dict[str, Optional[cq.Vector]] = {}
 
+        part_centroid = shape.val().Center()
+        for face in all_faces:
+            k = _face_key(face)
+            if face_type_by_key[k] == "CYLINDER" and k not in wall_keys:
+                row = _cylinder_bend_row(face, part_centroid, thickness)
+                if row:
+                    candidate_rows.append(row)
+
         for i in range(1, edge_face_map.Extent() + 1):
-            edge = edge_face_map.FindKey(i)
-            faces = _list_from_toptools_shape_list(edge_face_map.FindFromIndex(i))
+            edge = TopoDS.Edge_s(edge_face_map.FindKey(i))
+            faces = [
+                TopoDS.Face_s(f)
+                for f in _list_from_toptools_shape_list(edge_face_map.FindFromIndex(i))
+            ]
             if len(faces) < 2:
                 skipped_boundary += 1
                 continue
@@ -784,6 +900,13 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
                 continue
 
             f1, f2 = faces[0], faces[1]
+            k1 = _face_key(f1)
+            k2 = _face_key(f2)
+            # Edges onto a sheet's thin edge walls are its outline, not bends.
+            if k1 in wall_keys or k2 in wall_keys:
+                skipped_wall += 1
+                continue
+
             edge_pts = _edge_endpoints(edge)
             if not edge_pts:
                 continue
@@ -792,21 +915,21 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
             if edge_len < 0.5:
                 continue
 
-            edge_mid = cq.Vector(
+            edge_mid = _edge_midpoint(edge) or cq.Vector(
                 (p1.x + p2.x) * 0.5,
                 (p1.y + p2.y) * 0.5,
                 (p1.z + p2.z) * 0.5,
             )
-            k1 = _face_key(f1)
-            k2 = _face_key(f2)
-            n1 = face_normal_cache.get(k1)
-            n2 = face_normal_cache.get(k2)
-            if n1 is None:
-                n1 = _get_face_normal_at_point(f1, edge_mid)
-                face_normal_cache[k1] = n1
-            if n2 is None:
-                n2 = _get_face_normal_at_point(f2, edge_mid)
-                face_normal_cache[k2] = n2
+
+            def _normal(face, key):
+                if face_type_by_key.get(key) != "PLANE":
+                    return _get_face_normal_at_point(face, edge_mid)
+                if key not in face_normal_cache:
+                    face_normal_cache[key] = _get_face_normal_at_point(face, edge_mid)
+                return face_normal_cache[key]
+
+            n1 = _normal(f1, k1)
+            n2 = _normal(f2, k2)
             if not n1 or not n2:
                 continue
 
@@ -932,7 +1055,8 @@ def _extract_bend_features_v2(shape: cq.Workplane) -> List[Dict[str, Any]]:
         bends = _post_filter_manufacturing_bends(bends, thickness)
         print(
             f"[BendV2] candidates={len(candidate_rows)} merged={len(bends)} "
-            f"boundarySkipped={skipped_boundary} nonManifoldSkipped={skipped_non_manifold}"
+            f"boundarySkipped={skipped_boundary} nonManifoldSkipped={skipped_non_manifold} "
+            f"wallSkipped={skipped_wall}"
         )
         return bends
     except Exception as e:
@@ -957,12 +1081,13 @@ def _detect_thickness(shape: cq.Workplane) -> Optional[float]:
     try:
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopoDS import TopoDS
         wrapped = shape.val().wrapped
         
         planar_faces = []
         exp = TopExp_Explorer(wrapped, TopAbs_FACE)
         while exp.More():
-            face = exp.Current()
+            face = TopoDS.Face_s(exp.Current())
             if _classify_face_type(face) == 'PLANE':
                 from OCP.BRepAdaptor import BRepAdaptor_Surface
                 adaptor = BRepAdaptor_Surface(face)
@@ -973,13 +1098,16 @@ def _detect_thickness(shape: cq.Workplane) -> Optional[float]:
                     'face': face,
                     'normal': cq.Vector(normal.X(), normal.Y(), normal.Z()),
                     'location': cq.Vector(loc.X(), loc.Y(), loc.Z()),
+                    'area': cq.Face(face).Area(),
                 })
             exp.Next()
         
         print(f"[Thickness] Testing {len(planar_faces)} planar faces.")
         if len(planar_faces) < 2: return None
 
-        thicknesses = []
+        # Weight each parallel pair by its smaller face: the sheet's skins dominate,
+        # not the many small parallel side walls (e.g. sprocket tooth flanks).
+        thicknesses: Dict[float, float] = {}
         for i in range(len(planar_faces)):
             for j in range(i + 1, len(planar_faces)):
                 n1 = planar_faces[i]['normal']
@@ -987,11 +1115,12 @@ def _detect_thickness(shape: cq.Workplane) -> Optional[float]:
                 if abs(n1.dot(n2)) > 0.99:  # Parallel
                     dist = abs(n1.dot(planar_faces[i]['location']) - n1.dot(planar_faces[j]['location']))
                     if 0.3 < dist < 15.0:
-                        thicknesses.append(round(dist, 2))
+                        d = round(dist, 2)
+                        weight = min(planar_faces[i]['area'], planar_faces[j]['area'])
+                        thicknesses[d] = thicknesses.get(d, 0.0) + weight
 
         if not thicknesses: return None
-        from collections import Counter
-        most_common = Counter(thicknesses).most_common(1)[0][0]
+        most_common = max(thicknesses, key=thicknesses.get)
         print(f"[Thickness] Detected: {most_common}mm")
         return most_common
     except Exception as e:
@@ -1012,12 +1141,13 @@ def _validate_sheet_metal_shape(shape: cq.Workplane, thickness: Optional[float])
         from OCP.TopExp import TopExp_Explorer
         from OCP.TopAbs import TopAbs_FACE
         from OCP.BRepAdaptor import BRepAdaptor_Surface
+        from OCP.TopoDS import TopoDS
 
         wrapped = shape.val().wrapped
         planar_faces = []
         exp = TopExp_Explorer(wrapped, TopAbs_FACE)
         while exp.More():
-            face = exp.Current()
+            face = TopoDS.Face_s(exp.Current())
             ftype = _classify_face_type(face)
             if ftype not in ("PLANE", "CYLINDER"):
                 return False
@@ -1098,9 +1228,10 @@ def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness
         up_dir = gp_Dir(0, 1, 0)
         
         max_area = 0.0
+        from OCP.TopoDS import TopoDS
         face_exp = TopExp_Explorer(solid, TopAbs_FACE)
         while face_exp.More():
-            f = face_exp.Current()
+            f = TopoDS.Face_s(face_exp.Current())
             if _classify_face_type(f) == 'PLANE':
                 from OCP.BRepGProp import BRepGProp
                 from OCP.GProp import GProp_GProps
@@ -1149,7 +1280,7 @@ def _generate_flat_pattern_svg(shape: cq.Workplane, bends: List[Dict], thickness
                 return paths
             explorer = TopExp_Explorer(compound, TopAbs_EDGE)
             while explorer.More():
-                edge = explorer.Current()
+                edge = TopoDS.Edge_s(explorer.Current())
                 try:
                     curve = BRepAdaptor_Curve(edge)
                     n_pts = max(2, int((_edge_length(edge) or 1.0) / 0.5))  # sample every 0.5mm
@@ -1315,12 +1446,7 @@ def _analyze_step_bends(step_bytes: bytes) -> dict:
         flat_pattern = _generate_flat_pattern_svg(shape, bends, thickness)
 
         # 4. Bounding box
-        bb = shape.val().BoundingBox()
-        bounding_box = {
-            "x": round(bb.xlen, 3),
-            "y": round(bb.ylen, 3),
-            "z": round(bb.zlen, 3),
-        }
+        bounding_box = _exact_bounding_box(shape)
 
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
         print(
@@ -1388,6 +1514,8 @@ app.add_middleware(
         "/convert": authorize_convert,
         "/analyze-cnc": _service_only,
         "/internal/analyze-cnc": _service_only,
+        "/internal/analyze-sheet": _service_only,
+        "/internal/analyze-print": _service_only,
     },
 )
 convert_quota = ConvertQuota.from_env()
@@ -1410,6 +1538,19 @@ app.add_middleware(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _exact_bounding_box(shape) -> Dict[str, float]:
+    """Bounding box from the B-rep geometry, ignoring any mesh: once a shape has been
+    tessellated (STL export, HLR) CadQuery's BoundingBox() is padded by every face's
+    triangulation tolerance — +22 mm per axis on a 400-face sprocket."""
+    from OCP.BRepBndLib import BRepBndLib
+    from OCP.Bnd import Bnd_Box
+
+    box = Bnd_Box()
+    BRepBndLib.AddOptimal_s(shape.val().wrapped, box, False, False)
+    x0, y0, z0, x1, y1, z1 = box.Get()
+    return {"x": round(x1 - x0, 3), "y": round(y1 - y0, 3), "z": round(z1 - z0, 3)}
+
+
 def _count_triangles(stl_bytes: bytes) -> int:
     """Parse STL header to extract triangle count. Handles binary and ASCII."""
     if len(stl_bytes) < 84:
@@ -1417,9 +1558,8 @@ def _count_triangles(stl_bytes: bytes) -> int:
     
     # ASCII STL check: starts with 'solid'
     if stl_bytes.startswith(b"solid"):
-        # For simplicity, return 0 for ASCII or do a basic line count
-        # Three.js will still render it fine, this is just for the metadata log
-        return 0
+        # CadQuery writes ASCII STL: one "facet normal" line per triangle
+        return stl_bytes.count(b"facet normal")
         
     (count,) = struct.unpack_from("<I", stl_bytes, 80)
     return count
@@ -1475,12 +1615,7 @@ def _convert_step_to_stl(step_bytes: bytes) -> dict:
             stl_bytes_out = stl_f.read()
 
         # ── Bounding box (mm) ─────────────────────────────────────────────────
-        bb = shape.val().BoundingBox()
-        bounding_box = {
-            "x": round(bb.xlen, 3),
-            "y": round(bb.ylen, 3),
-            "z": round(bb.zlen, 3),
-        }
+        bounding_box = _exact_bounding_box(shape)
 
         triangle_count = _count_triangles(stl_bytes_out)
         stl_b64 = base64.b64encode(stl_bytes_out).decode("utf-8")
@@ -1616,22 +1751,25 @@ class ConversionJobStore:
 
         return current
 
-    def get_job(self, job_id: str) -> Optional[dict]:
-        with self._lock:
-            if job_id in self._memory_store:
-                return self._memory_store[job_id].copy()
+    @property
+    def mode(self) -> str:
+        """'firestore' when jobs are shared across replicas, else 'memory' (single replica only)."""
+        return "firestore" if self._db else "memory"
 
+    def get_job(self, job_id: str) -> Optional[dict]:
+        # With Firestore, it is the source of truth: another replica may be running
+        # this job, so a copy held here would go stale. Memory is only a fallback.
         if self._db:
             try:
                 doc = self._db.collection("conversionJobs").document(job_id).get()
                 if doc.exists:
-                    data = doc.to_dict()
-                    with self._lock:
-                        self._memory_store[job_id] = data.copy()
-                    return data
+                    return doc.to_dict()
             except Exception as exc:
                 print(f"[JobStore] Error reading job from Firestore: {exc}")
 
+        with self._lock:
+            if job_id in self._memory_store:
+                return self._memory_store[job_id].copy()
         return None
 
 
@@ -1725,6 +1863,8 @@ def root() -> dict:
             "convert": "/convert [POST]",
             "analyzeCnc": "/analyze-cnc [POST, service token]",
             "analyzeCncInternal": "/internal/analyze-cnc [POST, service token]",
+            "analyzeSheetInternal": "/internal/analyze-sheet [POST, service token]",
+            "analyzePrintInternal": "/internal/analyze-print [POST, service token]",
             "status": "/status/{jobId} [GET]",
         }
     }
@@ -1732,8 +1872,10 @@ def root() -> dict:
 
 @app.get("/health", tags=["ops"])
 def health() -> dict:
-    """Liveness probe — Railway / Docker health check hits this."""
-    return {"status": "ok", "version": app.version}
+    """Liveness probe — Railway / Docker health check hits this.
+    jobStore must read "firestore" before running more than one replica:
+    with "memory", a status poll that reaches another replica can't find the job."""
+    return {"status": "ok", "version": app.version, "jobStore": job_store.mode}
 
 
 async def _read_step_upload(file: UploadFile) -> Tuple[str, bytes]:
@@ -1884,3 +2026,154 @@ async def analyze_cnc_from_url(body: AnalyzeCncUrlRequest) -> JSONResponse:
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="Empty file received.")
     return await _run_cnc_analysis(body.fileName, content)
+
+
+PRINT_EXTENSIONS = {".step", ".stp", ".stl", ".obj"}
+
+
+async def _fetch_for_analysis(body: AnalyzeCncUrlRequest, allowed: set, label: str) -> bytes:
+    ext = os.path.splitext(body.fileName.lower())[1]
+    if ext not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Unsupported file type "{ext}" for {label}. Upload {", ".join(sorted(allowed))}.',
+        )
+    validate_file_url(body.fileUrl)
+    content = await run_in_threadpool(fetch_file, body.fileUrl, MAX_FILE_SIZE)
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+    return content
+
+
+async def _run_analysis(label: str, filename: str, fn, *args) -> JSONResponse:
+    try:
+        # OCCT / mesh work is CPU-bound — keep it off the event loop.
+        result = await run_in_threadpool(fn, *args)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[{label}] Error on {filename}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{label} failed: {exc}") from exc
+    print(f"[{label}] OK — {filename}, {result['analysisMs']} ms")
+    return JSONResponse(content=result)
+
+
+SHEET_EXTENSIONS = ACCEPTED_EXTENSIONS | {".dxf"}
+
+# A DXF is a flat profile with no thickness. It is extruded by this nominal
+# amount so the solid-based sheet analysis can measure it: flat area = volume / t
+# and cut length = edge area / t come out exact for any t.
+DXF_NOMINAL_THICKNESS_MM = 1.0
+
+
+def _dxf_unflip_ocs(msp) -> None:
+    """2D entities drawn with extrusion (0, 0, -1) — common in SolidWorks exports — store
+    X mirrored in their OCS; CadQuery's DXF reader treats it as world X. Rewrite them in WCS."""
+    for e in msp:
+        kind = e.dxftype()
+        if kind not in ("CIRCLE", "ARC", "LWPOLYLINE"):
+            continue
+        ex, ey, ez = e.dxf.extrusion
+        if ez >= 0 or abs(ex) > 1e-9 or abs(ey) > 1e-9:
+            continue
+        if kind == "LWPOLYLINE":
+            pts = [(-x, y, s, en, -b) for x, y, s, en, b in e.get_points("xyseb")]
+            e.set_points(pts, "xyseb")
+        else:
+            cx, cy, cz = e.dxf.center
+            e.dxf.center = (-cx, cy, cz)
+            if kind == "ARC":  # mirroring in X reverses the sweep
+                start, end = e.dxf.start_angle, e.dxf.end_angle
+                e.dxf.start_angle, e.dxf.end_angle = 180.0 - end, 180.0 - start
+        e.dxf.extrusion = (0.0, 0.0, 1.0)
+
+
+def analyze_dxf_sheet(dxf_bytes: bytes) -> Dict[str, Any]:
+    """DXF profile → /internal/analyze-sheet body, marked profileOnly (the customer
+    picks the thickness). Units are taken as millimetres. Raises ValueError on bad input."""
+    with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as f:
+        f.write(dxf_bytes)
+        dxf_path = f.name
+    try:
+        try:
+            doc = ezdxf.readfile(dxf_path)
+        except Exception as exc:
+            raise ValueError("DXF file could not be read. Save it as an ASCII DXF and try again.") from exc
+        # importDXF builds faces per layer and fails on any open wire, so CAD flat
+        # patterns (holes on INTERIOR_PROFILES, open lines on BEND / etch layers) break.
+        # Join edges across all layers instead, and keep only closed contours.
+        _dxf_unflip_ocs(doc.modelspace())
+        wires = [w for w in _dxf_convert(list(doc.modelspace()), 1e-6) if w.IsClosed()]
+        contours = []
+        for w in wires:
+            try:
+                face = cq.Face.makeFromWires(w)
+            except Exception:
+                continue
+            if face.isValid() and face.Area() > 0:
+                contours.append((face, w))
+        if not contours:
+            raise ValueError(
+                "No closed outline found in the DXF. Laser parts need closed contours — "
+                "join open lines into a closed profile."
+            )
+        # Largest first; a contour inside an odd number of larger ones is a hole.
+        # Booleans keep this independent of each contour's winding direction.
+        contours.sort(key=lambda c: c[0].Area(), reverse=True)
+        up = cq.Vector(0, 0, DXF_NOMINAL_THICKNESS_MM)
+        body = None
+        for i, (_, w) in enumerate(contours):
+            point = w.startPoint().toPnt()
+            depth = sum(
+                1 for bigger, _ in contours[:i]
+                if BRepClass_FaceClassifier(bigger.wrapped, point, 1e-6).State() == TopAbs_IN
+            )
+            # Extrude from wires: CadQuery 2.1 (production) can't extrude pending faces.
+            slab = cq.Solid.extrudeLinear(w, [], up)
+            if body is None:
+                body = slab
+            elif depth % 2:
+                body = body.cut(slab)
+            else:
+                body = body.fuse(slab)
+        solid = cq.Workplane("XY").add(body.Solids())
+        result = analyze_sheet_workplane(solid, [], thickness_mm=DXF_NOMINAL_THICKNESS_MM)
+        result["profileOnly"] = True
+        return result
+    finally:
+        try:
+            os.unlink(dxf_path)
+        except OSError:
+            pass
+
+
+def _analyze_sheet_file(file_name: str, content: bytes) -> Dict[str, Any]:
+    if os.path.splitext(file_name.lower())[1] == ".dxf":
+        return analyze_dxf_sheet(content)
+    return analyze_step_sheet(content, _extract_bend_features_v2)
+
+
+@app.post(
+    "/internal/analyze-sheet",
+    tags=["costing"],
+    dependencies=[Depends(require_service_token)],
+)
+async def analyze_sheet_from_url(body: AnalyzeCncUrlRequest) -> JSONResponse:
+    """Sheet-metal facts for laser + bending + tapping costing (service token required):
+    thickness, flat blank area, cut length, pierces, through holes and bends.
+    A DXF is a flat profile: no bends, and thickness is chosen by the customer."""
+    content = await _fetch_for_analysis(body, SHEET_EXTENSIONS, "sheet metal costing")
+    return await _run_analysis("analyze-sheet", body.fileName, _analyze_sheet_file, body.fileName, content)
+
+
+@app.post(
+    "/internal/analyze-print",
+    tags=["costing"],
+    dependencies=[Depends(require_service_token)],
+)
+async def analyze_print_from_url(body: AnalyzeCncUrlRequest) -> JSONResponse:
+    """FDM print facts (service token required): volume, surface area, and size on
+    the bed + support volume for each of the six axis-up orientations."""
+    content = await _fetch_for_analysis(body, PRINT_EXTENSIONS, "3D print costing")
+    return await _run_analysis("analyze-print", body.fileName, analyze_print_file, body.fileName, content)
