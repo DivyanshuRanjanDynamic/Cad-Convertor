@@ -68,19 +68,20 @@ class JobStoreAcrossReplicasTest(unittest.TestCase):
         shared = _FakeFirestore()
         a, b = _replica(shared), _replica(shared)
 
-        a.create_job("job1", "part.step", 100)
+        a.create_job("job1", "part.step", 100, owner="user:uid_1")
         # A poll lands on replica B while the job is still queued…
         self.assertEqual(b.get_job("job1")["status"], "queued")
         # …replica A finishes it…
-        a.update_job("job1", {"status": "completed", "resultUrl": "https://s3/result.stl"})
+        a.update_job("job1", {"status": "done", "result": {"stl": "AAAA"}})
         # …and B reports the result instead of a stale "queued"
-        self.assertEqual(b.get_job("job1")["status"], "completed")
-        self.assertEqual(b.get_job("job1")["resultUrl"], "https://s3/result.stl")
+        self.assertEqual(b.get_job("job1")["status"], "done")
+        self.assertEqual(b.get_job("job1")["result"], {"stl": "AAAA"})
+        self.assertEqual(b.get_job("job1")["owner"], "user:uid_1")
 
     def test_falls_back_to_its_own_copy_when_firestore_is_unreachable(self):
         shared = _FakeFirestore()
         a = _replica(shared)
-        a.create_job("job2", "part.step", 100)
+        a.create_job("job2", "part.step", 100, owner="user:uid_1")
         shared.fail_reads = True
         self.assertEqual(a.get_job("job2")["status"], "queued")
         self.assertIsNone(a.get_job("missing"))
@@ -90,7 +91,7 @@ class JobStoreAcrossReplicasTest(unittest.TestCase):
         memory = main.ConversionJobStore()
         memory._db = None
         self.assertEqual(memory.mode, "memory")
-        memory.create_job("job3", "part.step", 1)
+        memory.create_job("job3", "part.step", 1, owner="service")
         self.assertEqual(memory.get_job("job3")["status"], "queued")
 
     def test_health_says_which_store_is_in_use(self):

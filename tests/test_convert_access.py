@@ -182,5 +182,61 @@ class ConvertEndpointTest(unittest.TestCase):
         self.assertEqual(res.status_code, 401)
 
 
+@unittest.skipIf(main is None, "CadQuery / OCP not installed")
+class JobStatusTest(unittest.TestCase):
+    """/status is bound to the caller that created the job, and never leaks S3 links."""
+
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"CONVERTER_SERVICE_TOKEN": SECRET})
+        self.env.start()
+        self.store = main.ConversionJobStore()
+        self.store._db = None  # in-memory for the test
+        self.store_patch = mock.patch.object(main, "job_store", self.store)
+        self.store_patch.start()
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        self.store_patch.stop()
+        self.env.stop()
+
+    def status(self, job_id, token=None):
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        return self.client.get(f"/status/{job_id}", headers=headers)
+
+    def test_only_the_creator_can_read_a_job(self):
+        self.store.create_job("job_a", "part.step", 10, owner="user:uid_1")
+        self.store.update_job("job_a", {"status": "done", "result": {"stl": "AAAA"}})
+
+        self.assertEqual(self.status("job_a").status_code, 401)  # anonymous
+        self.assertEqual(self.status("job_a", ticket(sub="uid_2")).status_code, 404)  # someone else
+        self.assertEqual(self.status("job_a", ticket(sub="uid_1", secret="wrong")).status_code, 401)
+
+        mine = self.status("job_a", ticket(sub="uid_1"))  # a fresh ticket for the same user works
+        self.assertEqual(mine.status_code, 200)
+        self.assertEqual(mine.json()["result"], {"stl": "AAAA"})
+        self.assertNotIn("owner", mine.json())
+
+        self.assertEqual(self.status("job_a", SECRET).status_code, 200)  # the web app's service token
+
+    def test_old_jobs_never_return_s3_links(self):
+        # A job written before this change: no owner, S3 URLs stored
+        self.store.create_job("job_old", "part.step", 10, owner="user:uid_1")
+        self.store.update_job("job_old", {"owner": None, "fileUrl": "https://bucket/cad_uploads/x.step", "resultUrl": "https://bucket/x.stl"})
+        self.assertEqual(self.status("job_old", ticket(sub="uid_1")).status_code, 404)
+        body = self.status("job_old", SECRET).json()
+        self.assertNotIn("fileUrl", body)
+        self.assertNotIn("resultUrl", body)
+
+    def test_conversion_job_stores_no_copy_of_the_file(self):
+        self.assertFalse(hasattr(main, "_upload_to_s3"))
+        self.store.create_job("job_b", "part.step", 10, owner="user:uid_1")
+        with mock.patch.object(main, "_convert_step_to_stl", return_value={"stl": "AAAA"}):
+            main._process_conversion_job_bg("job_b", b"ISO-10303-21;", "part.step")
+        job = self.store.get_job("job_b")
+        self.assertEqual(job["status"], "done")
+        self.assertNotIn("fileUrl", job)
+        self.assertNotIn("resultUrl", job)
+
+
 if __name__ == "__main__":
     unittest.main()

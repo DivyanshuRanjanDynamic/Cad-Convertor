@@ -36,7 +36,7 @@ import ezdxf
 from cadquery.occ_impl.importers.dxf import _dxf_convert
 from OCP.BRepClass import BRepClass_FaceClassifier
 from OCP.TopAbs import TopAbs_IN
-from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query, Depends, Request
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, BackgroundTasks, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
@@ -47,7 +47,7 @@ from cnc_analysis import analyze_step_cnc
 from print_analysis import analyze_print_file
 from sheet_analysis import analyze_sheet_workplane, analyze_step_sheet
 from service_auth import require_service_token, validate_file_url, fetch_file
-from convert_access import ConvertQuota, RequireCallerMiddleware, authorize_convert
+from convert_access import SERVICE_CALLER, ConvertQuota, RequireCallerMiddleware, authorize_convert
 
 # ── Feature Extraction ────────────────────────────────────────────────────────
 
@@ -1705,17 +1705,18 @@ class ConversionJobStore:
             self._db = None
             print(f"[JobStore] Firestore initialization skipped (using in-memory store): {exc}")
 
-    def create_job(self, job_id: str, file_name: str, file_size: int) -> dict:
+    def create_job(self, job_id: str, file_name: str, file_size: int, owner: str) -> dict:
+        """`owner` is the caller id from RequireCallerMiddleware ("user:<uid>" or
+        "service"); only that caller may read the job back (see /status)."""
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         job_data = {
             "jobId": job_id,
             "status": "queued",
             "fileName": file_name,
             "fileSize": file_size,
+            "owner": owner,
             "createdAt": now,
             "updatedAt": now,
-            "fileUrl": None,
-            "resultUrl": None,
             "result": None,
             "error": None,
         }
@@ -1776,58 +1777,21 @@ class ConversionJobStore:
 job_store = ConversionJobStore()
 
 
-def _upload_to_s3(file_bytes: bytes, key: str, content_type: str = "application/octet-stream") -> Optional[str]:
-    """Uploads file bytes to AWS S3 if credentials & bucket are present."""
-    bucket_name = os.getenv("AWS_S3_BUCKET") or os.getenv("S3_BUCKET_NAME")
-    region = os.getenv("AWS_REGION", "eu-north-1")
-
-    if not bucket_name:
-        return None
-
-    try:
-        import boto3
-        s3_client = boto3.client("s3", region_name=region)
-        s3_client.put_object(
-            Bucket=bucket_name,
-            Key=key,
-            Body=file_bytes,
-            ContentType=content_type
-        )
-        url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{key}"
-        print(f"[S3] Successfully uploaded {key} to {url}")
-        return url
-    except Exception as exc:
-        print(f"[S3] Upload warning for {key}: {exc}")
-        return None
-
-
 def _process_conversion_job_bg(job_id: str, step_bytes: bytes, filename: str):
     """Background task executing the CadQuery conversion and updating job status."""
     print(f"[Async Job {job_id}] Processing started for '{filename}' ({len(step_bytes):,} bytes)...")
     job_store.update_job(job_id, {"status": "processing"})
 
     try:
-        # Optionally upload original STEP file to S3
-        step_s3_url = _upload_to_s3(step_bytes, f"cad_uploads/{job_id}/{filename}", "application/step")
-        if step_s3_url:
-            job_store.update_job(job_id, {"fileUrl": step_s3_url})
-
-        # Core CadQuery conversion
+        # Customers' CAD files are never copied to storage here: preview
+        # conversions are transient and the result goes back through /status.
+        # (Copies used to land in AWS_S3_BUCKET — a public bucket — with their
+        # URLs returned by the then-unauthenticated /status endpoint.)
         result = _convert_step_to_stl(step_bytes)
-
-        # Upload generated STL file to S3 if available
-        stl_s3_url = None
-        if result.get("stl"):
-            try:
-                stl_raw = base64.b64decode(result["stl"])
-                stl_s3_url = _upload_to_s3(stl_raw, f"cad_outputs/{job_id}.stl", "model/stl")
-            except Exception as exc:
-                print(f"[Async Job {job_id}] Could not upload STL to S3: {exc}")
 
         job_store.update_job(job_id, {
             "status": "done",
             "result": result,
-            "resultUrl": stl_s3_url,
         })
         print(f"[Async Job {job_id}] Completed successfully!")
 
@@ -1941,7 +1905,7 @@ async def convert(
     # ── Default Async Flow ──────────────────────────────────────────────────
     try:
         job_id = uuid.uuid4().hex
-        job_store.create_job(job_id, filename, len(content))
+        job_store.create_job(job_id, filename, len(content), owner=caller)
         background_tasks.add_task(_run_conversion_job, job_id, content, filename, caller)
     except Exception:
         convert_quota.release(caller)
@@ -1959,13 +1923,23 @@ async def convert(
     )
 
 
+# Never returned by /status: who owns the job, and the S3 links older jobs stored.
+_PRIVATE_JOB_FIELDS = ("owner", "fileUrl", "resultUrl")
+
+
 @app.get("/status/{job_id}", tags=["conversion"])
-def get_job_status(job_id: str) -> JSONResponse:
-    """Retrieve async CAD conversion job status and result payload."""
+def get_job_status(job_id: str, authorization: Optional[str] = Header(default=None)) -> JSONResponse:
+    """Retrieve async CAD conversion job status and result payload.
+
+    Same credentials as /convert (a user's convert ticket, or the service token).
+    A user sees only jobs they created — any other id is "not found", so job ids
+    can't be used to read someone else's geometry.
+    """
+    caller = authorize_convert(authorization or "")
     job = job_store.get_job(job_id)
-    if not job:
+    if not job or (caller != SERVICE_CALLER and job.get("owner") != caller):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
-    return JSONResponse(content=job)
+    return JSONResponse(content={k: v for k, v in job.items() if k not in _PRIVATE_JOB_FIELDS})
 
 
 async def _run_cnc_analysis(filename: str, content: bytes) -> JSONResponse:
